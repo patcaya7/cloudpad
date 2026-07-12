@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CloudPad",
+  "version": "0.6.76",
+  "identifier": "com.cloudpad.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "CloudPad",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "theme": "Light"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "CloudPad",
+    "homepage": "https://drive.google.com/drive/folders/1GJXNIPLtO5VnS0SPS4heBSkL0gNKzFbZ",
+    "copyright": "Copyright © 2026 CloudPad. All rights reserved.",
+    "license": "MIT",
+    "category": "Productivity",
+    "shortDescription": "Offline-first notepad with cloud sync",
+    "longDescription": "CloudPad is a desktop notepad that saves locally first and can sync to the cloud.",
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "tsp": true,
+      "nsis": {
+        "installMode": "currentUser",
+        "compression": "lzma",
+        "startMenuFolder": "CloudPad"
+      }
+    }
+  }
+}
+

@@ -1,0 +1,124 @@
+name: Release (build + sign Windows installer)
+
+# Builds the Windows NSIS installer in CI, then submits it to SignPath for
+# code signing. A signed installer no longer triggers SmartScreen / "unsafe"
+# warnings. SignPath Foundation only signs artifacts built by trusted CI, so
+# the build MUST run here (not from a local machine).
+#
+# Trigger: push a tag like v0.6.62, or run manually from the Actions tab.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  # SignPath needs to read the workflow run / artifact metadata
+  actions: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri installer and update artifacts (NSIS)
+        run: npm run tauri:build:update
+        env:
+          # Supabase keys come from repo secrets, NOT from a committed .env.
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
+      - name: Upload unsigned installer
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudpad-installer-unsigned
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
+      - name: Upload updater artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudpad-updater-artifacts
+          path: src-tauri/target/release/bundle/nsis/*.nsis.zip*
+          if-no-files-found: error
+
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Submit signing request to SignPath
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          # The two values below come from your SignPath dashboard after approval.
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: cloudpad
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ needs.build.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload SIGNED installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudpad-installer-signed
+          path: signed/**
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, sign]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download signed installer
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudpad-installer-signed
+          path: signed
+
+      - name: Download updater artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudpad-updater-artifacts
+          path: updater
+
+      - name: Create update manifest
+        run: node scripts/create-update-manifest.mjs updater latest.json
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: Publish release and update link
+        run: gh release create "$GITHUB_REF_NAME" signed/* updater/* latest.json --title "CloudPad $GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
