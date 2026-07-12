@@ -59,3 +59,11 @@ npm run tauri:build
 ```text
 src-tauri/target/release/bundle/nsis/
 ```
+
+## Code signing and downloads
+
+CloudPad release installers are built with GitHub Actions and submitted to the
+SignPath Foundation for code signing. Signed installers and release notes are
+published on the project's GitHub Releases page.
+
+See [Privacy Policy](PRIVACY.md) for how CloudPad handles user data.
