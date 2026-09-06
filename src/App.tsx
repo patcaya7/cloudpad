@@ -12,6 +12,7 @@ import type { FontWeight, Note, NoteTypography } from './types/note';
 import { DEFAULT_FONT_FAMILY, withEmojiFontFallback } from './types/note';
 import {
   createNote,
+  listAllNotes,
   listDeletedNotes,
   listNotes,
   permanentlyDeleteNote,
@@ -135,8 +136,25 @@ function normalizeColorInputValue(color: string | undefined, fallback = '#172033
 }
 
 const ZOOM_STORAGE_KEY = 'cloudpad.appZoom.v1';
-const NOTE_ZOOM_STORAGE_KEY = 'cloudpad.noteZoom.v1';
+const NOTE_ZOOM_STORAGE_KEY = 'cloudpad.noteZoom.v2';
 const WINDOW_SIZE_STORAGE_KEY = 'cloudpad.windowSize.v1';
+const SYNC_INTERVAL_STORAGE_KEY = 'cloudpad.syncIntervalSec.v1';
+// Must match EMOJI_INPUT_BRIDGE_STORAGE_KEY in CodeMirrorNoteEditor — the editor
+// reads this same flag to decide whether the Windows emoji bridge may activate.
+const EMOJI_BRIDGE_STORAGE_KEY = 'cloudpad.emojiBridge.v1';
+const DEFAULT_SYNC_INTERVAL_SEC = 60;
+const SYNC_INTERVAL_MIN_SEC = 15;
+const SYNC_INTERVAL_MAX_SEC = 3600;
+const SYNC_INTERVAL_OPTIONS: Array<{ value: number; label: string }> = [
+  { value: 15, label: '15 วินาที' },
+  { value: 30, label: '30 วินาที' },
+  { value: 60, label: '1 นาที' },
+  { value: 120, label: '2 นาที' },
+  { value: 300, label: '5 นาที' },
+  { value: 600, label: '10 นาที' },
+  { value: 1800, label: '30 นาที' },
+  { value: 3600, label: '1 ชั่วโมง' }
+];
 const WINDOW_MIN_WIDTH = 900;
 const WINDOW_MIN_HEIGHT = 600;
 const FIND_WINDOW_WIDTH = 900;
@@ -145,10 +163,23 @@ const FIND_WINDOW_MIN_WIDTH = 600;
 const FIND_WINDOW_MIN_HEIGHT = 420;
 const FIND_WINDOW_GAP = 12;
 const DEFAULT_APP_ZOOM = 1.3;
-const DEFAULT_NOTE_ZOOM = 1.2;
+// 100% now means "the sheet exactly fits the pane" (the fit is applied on top of
+// this), so the old 1.2 default would start everyone off with the sheet 20% wider
+// than the pane and a permanent sideways scrollbar. The storage key below is
+// bumped to v2 for the same reason: the number means something different now.
+const DEFAULT_NOTE_ZOOM = 1;
 const ZOOM_MIN = 0.5;
 const ZOOM_MAX = 2.5;
 const ZOOM_STEP = 0.1;
+// The note body is laid out on a sheet of this fixed width and then scaled to fit
+// the pane, so a line always breaks at the same word no matter how wide the
+// window, the sidebar or the app zoom happen to be. Only the drawn size changes.
+const NOTE_SHEET_WIDTH = 880;
+// Keep the automatic fit inside sane bounds: unreadably small on a very narrow
+// pane, or comically large on an ultrawide one. The manual "แผ่น %" control still
+// scales on top of whatever the fit picks.
+const NOTE_FIT_MIN = 0.4;
+const NOTE_FIT_MAX = 1.6;
 
 function DownloadIcon({ className }: { className?: string }) {
   return (
@@ -168,14 +199,39 @@ function UploadIcon({ className }: { className?: string }) {
   );
 }
 
-function SyncStatusIcon({ synced }: { synced: boolean }) {
+// Badge shown on each note card. 'syncing' is a live view state (a sync is in
+// flight for a note that still has local edits), not a stored sync_status.
+type NoteBadgeStatus = 'synced' | 'pending' | 'syncing';
+
+const NOTE_BADGE_LABEL: Record<NoteBadgeStatus, string> = {
+  synced: 'synced',
+  pending: 'pending',
+  syncing: 'syncing'
+};
+
+const NOTE_BADGE_TITLE: Record<NoteBadgeStatus, string> = {
+  synced: 'ซิงก์แล้ว (synced)',
+  pending: 'รอซิงก์ (pending)',
+  syncing: 'กำลังซิงก์ขึ้น Cloud (syncing)'
+};
+
+// A note with local edits reads as 'syncing' while a sync is actually in flight,
+// so the card animates live instead of sitting on a frozen-looking "pending".
+function noteBadgeStatus(note: Note, syncState: SyncState): NoteBadgeStatus {
+  if (note.syncStatus === 'synced') return 'synced';
+  return syncState === 'syncing' ? 'syncing' : 'pending';
+}
+
+function SyncStatusIcon({ status }: { status: NoteBadgeStatus }) {
   return (
-    <svg className={`sync-status-icon ${synced ? 'synced' : 'pending'}`} aria-hidden="true" viewBox="0 0 20 20" fill="none">
+    <svg className={`sync-status-icon ${status}`} aria-hidden="true" viewBox="0 0 20 20" fill="none">
       <circle cx="10" cy="10" r="7.25" stroke="currentColor" strokeWidth="2.1" />
-      {synced ? (
+      {status === 'synced' ? (
         <path d="m6.7 10.15 2.05 2.05 4.55-4.6" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" />
+      ) : status === 'syncing' ? (
+        <path className="sync-status-icon-arc" d="M10 2.75a7.25 7.25 0 0 1 7.25 7.25" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" />
       ) : (
-        <circle cx="10" cy="10" r="2.15" fill="currentColor" />
+        <circle className="sync-status-icon-dot" cx="10" cy="10" r="2.15" fill="currentColor" />
       )}
     </svg>
   );
@@ -185,6 +241,122 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+// Themed replacement for the browser's native `title` tooltip. Any element with a
+// `data-tooltip` attribute gets a light CloudPad-styled bubble on hover — themeable,
+// multi-line, and clamped inside the window. One delegated listener covers the whole
+// app, so adding a tooltip anywhere is just `data-tooltip="..."`.
+function CustomTooltip() {
+  const [content, setContent] = useState<{ text: string; x: number; y: number } | null>(null);
+  const [coords, setCoords] = useState<{ left: number; top: number } | null>(null);
+  const tipRef = useRef<HTMLDivElement | null>(null);
+  const showTimerRef = useRef<number | null>(null);
+  const targetRef = useRef<Element | null>(null);
+  const cursorRef = useRef({ x: 0, y: 0 });
+
+  useEffect(() => {
+    const SHOW_DELAY_MS = 320;
+
+    const clearTimer = () => {
+      if (showTimerRef.current !== null) {
+        window.clearTimeout(showTimerRef.current);
+        showTimerRef.current = null;
+      }
+    };
+
+    const hide = () => {
+      clearTimer();
+      targetRef.current = null;
+      setContent(null);
+      setCoords(null);
+    };
+
+    const findTarget = (node: EventTarget | null): Element | null =>
+      node instanceof Element ? node.closest('[data-tooltip]') : null;
+
+    const handleOver = (event: PointerEvent) => {
+      if (event.pointerType === 'touch') return;
+      const target = findTarget(event.target);
+      if (!target) {
+        if (targetRef.current) hide();
+        return;
+      }
+      const text = target.getAttribute('data-tooltip');
+      if (!text) {
+        hide();
+        return;
+      }
+      if (target === targetRef.current) return;
+      targetRef.current = target;
+      cursorRef.current = { x: event.clientX, y: event.clientY };
+      clearTimer();
+      setContent(null);
+      setCoords(null);
+      showTimerRef.current = window.setTimeout(() => {
+        showTimerRef.current = null;
+        setContent({ text, x: cursorRef.current.x, y: cursorRef.current.y });
+      }, SHOW_DELAY_MS);
+    };
+
+    const handleMove = (event: PointerEvent) => {
+      if (!targetRef.current) return;
+      cursorRef.current = { x: event.clientX, y: event.clientY };
+      if (findTarget(event.target) !== targetRef.current) hide();
+    };
+
+    document.addEventListener('pointerover', handleOver, true);
+    document.addEventListener('pointermove', handleMove, true);
+    document.addEventListener('pointerdown', hide, true);
+    window.addEventListener('scroll', hide, true);
+    window.addEventListener('blur', hide);
+    return () => {
+      clearTimer();
+      document.removeEventListener('pointerover', handleOver, true);
+      document.removeEventListener('pointermove', handleMove, true);
+      document.removeEventListener('pointerdown', hide, true);
+      window.removeEventListener('scroll', hide, true);
+      window.removeEventListener('blur', hide);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!content || !tipRef.current) return;
+    const MARGIN = 8;
+    const OFFSET_X = 14;
+    const OFFSET_Y = 16;
+    const rect = tipRef.current.getBoundingClientRect();
+    let left = content.x + OFFSET_X;
+    let top = content.y + OFFSET_Y;
+    if (left + rect.width > window.innerWidth - MARGIN) {
+      left = window.innerWidth - rect.width - MARGIN;
+    }
+    if (top + rect.height > window.innerHeight - MARGIN) {
+      top = content.y - rect.height - OFFSET_Y;
+    }
+    setCoords({
+      left: Math.max(MARGIN, left),
+      top: Math.max(MARGIN, top)
+    });
+  }, [content]);
+
+  if (!content) return null;
+
+  return createPortal(
+    <div
+      ref={tipRef}
+      className="custom-tooltip"
+      role="tooltip"
+      style={{
+        left: coords ? coords.left : content.x + 14,
+        top: coords ? coords.top : content.y + 16,
+        visibility: coords ? 'visible' : 'hidden'
+      }}
+    >
+      {content.text}
+    </div>,
+    document.body
+  );
+}
+
 // Read a persisted zoom value, falling back to the intended default when the key
 // is missing/blank. (Number(null) === 0 is finite, which previously forced 50%.)
 function readStoredZoom(key: string, fallback: number): number {
@@ -192,6 +364,23 @@ function readStoredZoom(key: string, fallback: number): number {
   if (raw === null || raw.trim() === '') return fallback;
   const value = Number(raw);
   return Number.isFinite(value) ? clamp(value, ZOOM_MIN, ZOOM_MAX) : fallback;
+}
+
+// Auto-sync interval (seconds). Kept within safe bounds so a corrupt/hand-edited
+// value can never hammer the server or effectively disable syncing.
+function readStoredSyncIntervalSec(): number {
+  const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(SYNC_INTERVAL_STORAGE_KEY) : null;
+  if (raw === null || raw.trim() === '') return DEFAULT_SYNC_INTERVAL_SEC;
+  const value = Number(raw);
+  return Number.isFinite(value)
+    ? Math.round(clamp(value, SYNC_INTERVAL_MIN_SEC, SYNC_INTERVAL_MAX_SEC))
+    : DEFAULT_SYNC_INTERVAL_SEC;
+}
+
+function formatSyncInterval(sec: number): string {
+  if (sec % 3600 === 0) return `${sec / 3600} ชั่วโมง`;
+  if (sec % 60 === 0) return `${sec / 60} นาที`;
+  return `${sec} วินาที`;
 }
 
 function compareNotesForList(a: Note, b: Note): number {
@@ -571,36 +760,20 @@ function SmoothSyncStatus({
   message: string;
   transient?: boolean;
 }) {
-  const measurerRef = useRef<HTMLSpanElement | null>(null);
-  const [pillWidth, setPillWidth] = useState<number | null>(null);
-
-  useLayoutEffect(() => {
-    const measurer = measurerRef.current;
-    if (!measurer) return;
-    // Measure a separate, position:absolute twin instead of the visible pill
-    // itself. The twin never has an explicit width and sits outside the topbar's
-    // flex flow, so its natural size for this message is never contaminated by
-    // the visible pill's own current (possibly still-animating, flex-affected)
-    // box — that's what makes the width below reliable in BOTH directions
-    // (growing and shrinking), not just growing.
-    setPillWidth(measurer.getBoundingClientRect().width);
-  }, [message]);
-
+  // The pill sizes itself to its text via CSS (inline-flex + width: fit-content).
+  // No JS measurement / explicit width lock: that approach could freeze a too-wide
+  // width (e.g. measured before the font loaded, or off a longer transient message),
+  // leaving the border overflowing the text. Natural sizing always hugs the current
+  // message exactly and re-fits on font load, zoom, or message change.
   return (
-    <>
-      <span
-        className={`status-pill ${state} ${transient ? 'transient' : ''}`}
-        style={pillWidth ? { width: `${pillWidth}px` } : undefined}
-        aria-live="polite"
-        aria-atomic="true"
-        title={message}
-      >
-        <span className="status-pill-message">{message}</span>
-      </span>
-      <span ref={measurerRef} className={`status-pill status-pill-measurer ${state}`} aria-hidden="true">
-        <span className="status-pill-message">{message}</span>
-      </span>
-    </>
+    <span
+      className={`status-pill ${state} ${transient ? 'transient' : ''}`}
+      aria-live="polite"
+      aria-atomic="true"
+      title={message}
+    >
+      <span className="status-pill-message">{message}</span>
+    </span>
   );
 }
 
@@ -613,11 +786,21 @@ export default function App() {
   const [initialFilter, setInitialFilter] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<SyncState>('local');
   const [syncMessage, setSyncMessage] = useState('กำลังเตรียมข้อมูลในเครื่อง...');
-  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [lastSavedMessage, setLastSavedMessage] = useState<string | null>(null);
   const [appZoom, setAppZoom] = useState(() => readStoredZoom(ZOOM_STORAGE_KEY, DEFAULT_APP_ZOOM));
   const [noteZoom, setNoteZoom] = useState(() => readStoredZoom(NOTE_ZOOM_STORAGE_KEY, DEFAULT_NOTE_ZOOM));
+  // Live width of the pane the note sheet is drawn in; drives the automatic fit.
+  const [noteCanvasWidth, setNoteCanvasWidth] = useState(0);
+  const [syncIntervalSec, setSyncIntervalSec] = useState(() => readStoredSyncIntervalSec());
+  const [syncIntervalDraft, setSyncIntervalDraft] = useState(() => readStoredSyncIntervalSec());
+  const [emojiBridgeEnabled, setEmojiBridgeEnabled] = useState(() => {
+    try {
+      return localStorage.getItem(EMOJI_BRIDGE_STORAGE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [activeFormatTarget, setActiveFormatTarget] = useState<'title' | 'body'>('body');
   const [formatContextMenu, setFormatContextMenu] = useState<FormatContextMenuState>({
     open: false,
@@ -657,7 +840,11 @@ export default function App() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [accountMessage, setAccountMessage] = useState<string | null>(null);
+  const [authView, setAuthView] = useState<'login' | 'reset-request' | 'reset-confirm'>('login');
+  const [resetOtp, setResetOtp] = useState('');
+  const [newPassword, setNewPassword] = useState('');
   const editorRef = useRef<HTMLDivElement | null>(null);
+  const noteCanvasRef = useRef<HTMLDivElement | null>(null);
   const codeEditorRef = useRef<CodeMirrorNoteEditorHandle | null>(null);
   const titleCodeEditorRef = useRef<CodeMirrorNoteEditorHandle | null>(null);
   const activeFormatTargetRef = useRef<'title' | 'body'>('body');
@@ -710,9 +897,14 @@ export default function App() {
   const canUseNotes = !auth.cloudEnabled || Boolean(auth.user);
   const selectedNote = notes.find((note) => note.id === selectedId) ?? notes[0] ?? null;
   const appStyle = { '--app-zoom': String(appZoom) } as CSSProperties;
+  const noteFit = noteCanvasWidth > 0
+    ? clamp(noteCanvasWidth / NOTE_SHEET_WIDTH, NOTE_FIT_MIN, NOTE_FIT_MAX)
+    : 1;
   const selectedNoteStyle: CSSProperties | undefined = selectedNote
     ? {
         '--note-zoom': String(noteZoom),
+        '--note-fit': noteFit.toFixed(4),
+        '--note-sheet-width': `${NOTE_SHEET_WIDTH}px`,
         color: selectedNote.textColor.toLowerCase() === '#172033' ? '#0f172a' : selectedNote.textColor,
         fontFamily: selectedNote.fontFamily,
         fontSize: `${selectedNote.fontSize}px`,
@@ -809,6 +1001,28 @@ export default function App() {
     });
   }, [auth.cloudEnabled, auth.user]);
 
+  // The note list keeps an optimistic 'pending' badge the moment an edit is saved
+  // (see promoteNoteToTopInList). That marker can outlive the real state: if a sync
+  // uploads the note while the save is still awaiting its DB write, the badge is set
+  // back to 'pending' after the sync already reported 'synced'. Nothing then clears
+  // it — a later sync finds nothing to do and returns 0/0 — so the card sat on
+  // "pending" forever. Reconcile against the DB (the source of truth) after every
+  // sync, regardless of the counts.
+  const reconcileSyncStatuses = useCallback(async () => {
+    const stored = await listAllNotes();
+    const statusById = new Map(stored.map((note) => [note.id, note.syncStatus]));
+    setNotes((current) => {
+      let changed = false;
+      const next = current.map((note) => {
+        const actual = statusById.get(note.id);
+        if (!actual || actual === note.syncStatus) return note;
+        changed = true;
+        return { ...note, syncStatus: actual };
+      });
+      return changed ? next : current;
+    });
+  }, []);
+
   const handleSync = useCallback(async () => {
     if (!auth.cloudEnabled) {
       setSyncState('local');
@@ -832,22 +1046,34 @@ export default function App() {
       // re-renders the whole note list and makes the UI stutter while typing.
       if (result.downloadedCount > 0) {
         await reloadNotes();
-      } else if (result.uploadedCount > 0) {
-        // Reflect the "synced" badge in place, without a full reload.
-        setNotes((current) =>
-          current.some((note) => note.syncStatus === 'pending')
-            ? current.map((note) =>
-                note.syncStatus === 'pending' ? { ...note, syncStatus: 'synced' as const } : note
-              )
-            : current
-        );
+      } else {
+        // Never blanket-flip every 'pending' card to 'synced' here: a note edited
+        // during this sync is genuinely still pending and would show a false
+        // "synced". Read the real per-note status back instead.
+        await reconcileSyncStatuses();
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ';
       setSyncState('error');
       setSyncMessage(`ซิงก์ไม่สำเร็จ: ${message}`);
     }
-  }, [auth.cloudEnabled, auth.user, reloadNotes]);
+  }, [auth.cloudEnabled, auth.user, reconcileSyncStatuses, reloadNotes]);
+
+  const handleSaveSyncInterval = useCallback(() => {
+    const next = Math.round(clamp(syncIntervalDraft, SYNC_INTERVAL_MIN_SEC, SYNC_INTERVAL_MAX_SEC));
+    setSyncIntervalDraft(next);
+    setSyncIntervalSec(next);
+    try {
+      localStorage.setItem(SYNC_INTERVAL_STORAGE_KEY, String(next));
+    } catch {
+      // localStorage may be unavailable (private mode); the in-memory value still applies.
+    }
+    // Restarting the sync loop is handled by the effect that depends on syncIntervalSec:
+    // it clears the pending timer and ticks immediately, so the new cadence is exact and
+    // takes effect right away. Sync now for instant confirmation the setting landed.
+    void handleSync();
+    setAccountMessage(`บันทึกแล้ว · ซิงก์อัตโนมัติทุก ${formatSyncInterval(next)}`);
+  }, [handleSync, syncIntervalDraft]);
 
   useEffect(() => {
     async function boot() {
@@ -887,26 +1113,34 @@ export default function App() {
     // stutter active typing. If the user edited very recently, push this tick back
     // a few seconds and recheck, instead of syncing immediately or waiting a full
     // interval.
-    const SYNC_INTERVAL_MS = 60_000;
+    const SYNC_INTERVAL_MS = syncIntervalSec * 1000;
     const SYNC_IDLE_THRESHOLD_MS = 2000;
     const SYNC_RETRY_MS = 3000;
     let timeoutId: number | null = null;
 
-    const tick = () => {
+    // Schedule the next tick at exactly the configured interval, measured from the
+    // moment a sync actually ran — so short retries caused by active typing never
+    // drift the cadence. Re-runs of this effect (e.g. after saving a new interval)
+    // clear the pending timer and restart from now, so the change applies at once.
+    const scheduleNext = (delayMs: number) => {
+      timeoutId = window.setTimeout(tick, delayMs);
+    };
+
+    function tick() {
       const idleFor = Date.now() - lastEditActivityAtRef.current;
       if (idleFor < SYNC_IDLE_THRESHOLD_MS) {
-        timeoutId = window.setTimeout(tick, SYNC_RETRY_MS);
+        scheduleNext(SYNC_RETRY_MS);
         return;
       }
       void handleSync();
-      timeoutId = window.setTimeout(tick, SYNC_INTERVAL_MS);
-    };
+      scheduleNext(SYNC_INTERVAL_MS);
+    }
 
     tick();
     return () => {
       if (timeoutId !== null) window.clearTimeout(timeoutId);
     };
-  }, [auth.cloudEnabled, auth.loading, auth.user, handleSync]);
+  }, [auth.cloudEnabled, auth.loading, auth.user, handleSync, syncIntervalSec]);
 
   useEffect(() => {
     localStorage.setItem(ZOOM_STORAGE_KEY, String(appZoom));
@@ -915,6 +1149,26 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(NOTE_ZOOM_STORAGE_KEY, String(noteZoom));
   }, [noteZoom]);
+
+  // Track the pane the sheet is drawn in. clientWidth is a LAYOUT width, so it is
+  // already free of the app-zoom transform — exactly the number the sheet's own
+  // scale has to be derived from. `scrollbar-gutter: stable` on the pane keeps a
+  // vertical scrollbar from changing this width, so there is no observer loop.
+  useEffect(() => {
+    const canvas = noteCanvasRef.current;
+    if (!canvas) {
+      setNoteCanvasWidth(0);
+      return;
+    }
+    const measure = () => {
+      const width = canvas.clientWidth;
+      if (width > 0) setNoteCanvasWidth(width);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, [selectedNote?.id]);
 
   useEffect(() => {
     // Show the What's New panel automatically once per version bump — but never
@@ -1039,36 +1293,6 @@ export default function App() {
     const timeoutId = window.setTimeout(() => setLastSavedMessage(null), 2400);
     return () => window.clearTimeout(timeoutId);
   }, [lastSavedMessage]);
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-
-    let cancelled = false;
-
-    const installLatestUpdate = async () => {
-      try {
-        const { check } = await import('@tauri-apps/plugin-updater');
-        const update = await check({ timeout: 30_000 });
-        if (!update || cancelled) return;
-
-        setUpdateMessage(`กำลังดาวน์โหลดอัปเดต v${update.version}...`);
-        await update.downloadAndInstall((event) => {
-          if (!cancelled && event.event === 'Finished') {
-            setUpdateMessage('ดาวน์โหลดเสร็จแล้ว กำลังติดตั้งอัปเดต...');
-          }
-        });
-      } catch (error) {
-        console.warn('CloudPad update check failed:', error);
-      } finally {
-        if (!cancelled) setUpdateMessage(null);
-      }
-    };
-
-    void installLatestUpdate();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -1647,7 +1871,13 @@ export default function App() {
     } finally {
       setIsSaving(false);
     }
-  }, [auth.user?.id, getEditorContentHtml, getEditorPlainText, promoteSavedNote, selectedNote]);
+
+    // Ctrl+S means "save it now", not "save it locally and wait up to a full sync
+    // interval". Without this the card sat on 'pending' until the next background
+    // tick even though the user had explicitly asked to save. Fire-and-forget: the
+    // sync's own state updates drive the badge (pending → syncing → synced).
+    void handleSync();
+  }, [auth.user?.id, getEditorContentHtml, getEditorPlainText, handleSync, promoteSavedNote, selectedNote]);
 
   const clearSavedSelectionHighlight = useCallback(() => {
     const cssWithHighlights = CSS as unknown as { highlights?: { delete: (name: string) => void } };
@@ -3033,7 +3263,10 @@ export default function App() {
       }
 
       if (key === 'b' || keyCode === 'KeyB') {
-        if (isCodeMirrorTarget) return;
+        // Do NOT bail out on a CodeMirror target: the editor has no bold binding of
+        // its own, and toggleBoldFormatting() already routes to the focused
+        // CodeMirror editor (codeEditorRef/titleCodeEditorRef.toggleBold). Returning
+        // here left Ctrl+B dead inside the note — bold only worked from the menu.
         if (isFormControlTarget) return;
         event.preventDefault();
         event.stopPropagation();
@@ -3102,19 +3335,24 @@ export default function App() {
         return;
       }
 
-      if (key === '=' || key === '+') {
+      // Zoom keys need a keyCode fallback like the letter shortcuts above: with a
+      // Thai keyboard layout active, event.key for these keys is a Thai character,
+      // so matching on `key` alone left Ctrl+= / Ctrl+- / Ctrl+0 dead while typing
+      // Thai. keyCode is layout-independent (physical key), and Numpad variants are
+      // covered too.
+      if (key === '=' || key === '+' || keyCode === 'Equal' || keyCode === 'NumpadAdd') {
         event.preventDefault();
         setNoteZoom((current) => clamp(Number((current + ZOOM_STEP).toFixed(2)), ZOOM_MIN, ZOOM_MAX));
         return;
       }
 
-      if (key === '-' || key === '_') {
+      if (key === '-' || key === '_' || keyCode === 'Minus' || keyCode === 'NumpadSubtract') {
         event.preventDefault();
         setNoteZoom((current) => clamp(Number((current - ZOOM_STEP).toFixed(2)), ZOOM_MIN, ZOOM_MAX));
         return;
       }
 
-      if (key === '0') {
+      if (key === '0' || keyCode === 'Digit0' || keyCode === 'Numpad0') {
         event.preventDefault();
         setNoteZoom(1);
       }
@@ -3164,6 +3402,31 @@ export default function App() {
     }
   }
 
+  async function handleRequestPasswordReset() {
+    setAccountMessage(null);
+    try {
+      await auth.requestPasswordReset(email.trim());
+      setAccountMessage('ส่งรหัสยืนยันไปที่อีเมลแล้ว กรุณาตรวจสอบกล่องจดหมาย');
+      setAuthView('reset-confirm');
+    } catch {
+      // Error is displayed from the auth store.
+    }
+  }
+
+  async function handleConfirmPasswordReset() {
+    setAccountMessage(null);
+    try {
+      await auth.confirmPasswordReset(email.trim(), resetOtp.trim(), newPassword);
+      setPassword('');
+      setResetOtp('');
+      setNewPassword('');
+      setAuthView('login');
+      setAccountMessage('ตั้งรหัสผ่านใหม่สำเร็จ เข้าสู่ระบบเรียบร้อยแล้ว');
+    } catch {
+      // Error is displayed from the auth store.
+    }
+  }
+
   async function handleLogout() {
     setAccountMessage(null);
     try {
@@ -3179,6 +3442,8 @@ export default function App() {
   }
 
   const canSubmitAccount = email.trim().length > 0 && password.length >= 6 && !auth.loading;
+  const canSubmitResetRequest = email.trim().length > 0 && !auth.loading;
+  const canSubmitResetConfirm = resetOtp.trim().length > 0 && newPassword.length >= 6 && !auth.loading;
   const findPanelPortal = isFindOpen && typeof document !== 'undefined'
     ? createPortal(
         <FindReplacePanel
@@ -3318,20 +3583,17 @@ export default function App() {
       )
     : null;
 
-  const topbarStatusState: SyncState | 'saved' = updateMessage
-    ? 'syncing'
-    : isSaving
+  const topbarStatusState: SyncState | 'saved' = isSaving
     ? 'syncing'
     : lastSavedMessage
       ? 'saved'
       : syncState;
 
-  const topbarStatusMessage = updateMessage
-    ?? (isSaving
+  const topbarStatusMessage = isSaving
     ? 'กำลังบันทึกในเครื่อง...'
     : lastSavedMessage
       ? lastSavedMessage
-      : syncMessage);
+      : syncMessage;
 
   return (
     <>
@@ -3364,10 +3626,119 @@ export default function App() {
             ) : auth.user ? (
               <>
                 <p className="account-email">{auth.user.email}</p>
-                <p className="account-help">ซิงก์อัตโนมัติทุก 60 วินาที</p>
+                <div className="sync-interval-setting">
+                  <label className="sync-interval-label" htmlFor="syncIntervalSelect">
+                    ซิงก์อัตโนมัติทุก
+                  </label>
+                  <div className="sync-interval-row">
+                    <select
+                      id="syncIntervalSelect"
+                      className="sync-interval-select"
+                      value={syncIntervalDraft}
+                      onChange={(event) => setSyncIntervalDraft(Number(event.target.value))}
+                    >
+                      {SYNC_INTERVAL_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className="primary-button sync-interval-save"
+                      onClick={handleSaveSyncInterval}
+                      disabled={syncIntervalDraft === syncIntervalSec}
+                    >
+                      บันทึก
+                    </button>
+                  </div>
+                  <p className="account-help sync-interval-current">
+                    ปัจจุบัน: ทุก {formatSyncInterval(syncIntervalSec)}
+                  </p>
+                </div>
                 <button className="secondary-button full-width" onClick={handleLogout} disabled={auth.loading}>
                   ออกจากระบบ
                 </button>
+              </>
+            ) : authView === 'reset-request' ? (
+              <>
+                <input
+                  className="account-input"
+                  type="email"
+                  value={email}
+                  onChange={(event) => {
+                    setEmail(event.target.value);
+                    auth.clearError();
+                  }}
+                  placeholder="อีเมลที่ใช้สมัคร"
+                  autoComplete="email"
+                />
+                <p className="account-help">กรอกอีเมลที่ใช้สมัคร ระบบจะส่งรหัสยืนยันไปให้ทางอีเมล</p>
+                <div className="account-actions">
+                  <button
+                    className="primary-button"
+                    onClick={handleRequestPasswordReset}
+                    disabled={!canSubmitResetRequest}
+                  >
+                    ส่งรหัสยืนยัน
+                  </button>
+                  <button
+                    className="secondary-button"
+                    onClick={() => {
+                      setAuthView('login');
+                      auth.clearError();
+                      setAccountMessage(null);
+                    }}
+                  >
+                    ย้อนกลับ
+                  </button>
+                </div>
+              </>
+            ) : authView === 'reset-confirm' ? (
+              <>
+                <p className="account-email">{email}</p>
+                <input
+                  className="account-input"
+                  type="text"
+                  inputMode="numeric"
+                  value={resetOtp}
+                  onChange={(event) => {
+                    setResetOtp(event.target.value);
+                    auth.clearError();
+                  }}
+                  placeholder="รหัสยืนยันจากอีเมล"
+                  autoComplete="one-time-code"
+                />
+                <input
+                  className="account-input"
+                  type="password"
+                  value={newPassword}
+                  onChange={(event) => {
+                    setNewPassword(event.target.value);
+                    auth.clearError();
+                  }}
+                  placeholder="รหัสผ่านใหม่อย่างน้อย 6 ตัว"
+                  autoComplete="new-password"
+                />
+                <div className="account-actions">
+                  <button
+                    className="primary-button"
+                    onClick={handleConfirmPasswordReset}
+                    disabled={!canSubmitResetConfirm}
+                  >
+                    ตั้งรหัสผ่านใหม่
+                  </button>
+                  <button
+                    className="secondary-button"
+                    onClick={() => {
+                      setAuthView('login');
+                      auth.clearError();
+                      setAccountMessage(null);
+                    }}
+                  >
+                    ย้อนกลับ
+                  </button>
+                </div>
               </>
             ) : (
               <>
@@ -3401,8 +3772,39 @@ export default function App() {
                     สมัคร
                   </button>
                 </div>
+                <button
+                  type="button"
+                  className="link-button forgot-password-link"
+                  onClick={() => {
+                    setAuthView('reset-request');
+                    auth.clearError();
+                    setAccountMessage(null);
+                  }}
+                >
+                  ลืมรหัสผ่าน?
+                </button>
               </>
             )}
+
+            <label className="emoji-bridge-setting" title="เปิดเพื่อใช้ Win+. แทรกอีโมจิ">
+              <input
+                type="checkbox"
+                checked={emojiBridgeEnabled}
+                onChange={(event) => {
+                  const next = event.target.checked;
+                  setEmojiBridgeEnabled(next);
+                  try {
+                    localStorage.setItem(EMOJI_BRIDGE_STORAGE_KEY, next ? 'true' : 'false');
+                  } catch {
+                    // ignore storage errors (private mode); the checkbox still reflects intent
+                  }
+                }}
+              />
+              <span className="emoji-bridge-setting__text">
+                <strong>รองรับอิโมจิ Windows (Win+.)</strong>
+                <small>ปิดไว้ = พิมพ์ลื่นสุด · เปิด = ใช้ Win+. ได้ และ Win+Space จะคืนโฟกัสทันที</small>
+              </span>
+            </label>
 
             {(auth.error || accountMessage) && (
               <p className={auth.error ? 'account-error' : 'account-success'}>
@@ -3609,7 +4011,7 @@ export default function App() {
               tabIndex={0}
               className={`note-card ${selectedNote?.id === note.id ? 'active' : ''} ${note.isPinned ? 'pinned' : ''} ${draggingNoteId === note.id ? 'dragging' : ''} ${dragOverNoteId === note.id && draggingNoteId !== note.id ? 'drag-over' : ''} ${isNoteSelectMode ? 'select-mode' : ''} ${bulkSelectedNoteIds.includes(note.id) ? 'selected' : ''}`}
               draggable={false}
-              title={isNoteSelectMode ? 'คลิกเพื่อเลือก/ยกเลิกเลือก' : 'คลิกขวาเพื่อปักหมุด / ลากเพื่อจัดลำดับ'}
+              data-tooltip={isNoteSelectMode ? 'คลิกเพื่อเลือก/ยกเลิกเลือก' : 'คลิกขวาเพื่อปักหมุด / ลากเพื่อจัดลำดับ'}
               onKeyDown={(event) => {
                 if (event.key !== 'Enter' && event.key !== ' ') return;
                 event.preventDefault();
@@ -3697,25 +4099,22 @@ export default function App() {
                 />
               )}
               {note.isPinned && <span className="note-pin-indicator" aria-label="ปักหมุด">📌</span>}
-              <strong title={note.title || 'ไม่มีชื่อ'}>
+              <strong data-tooltip={note.title || 'ไม่มีชื่อ'}>
                 {renderSearchHighlight(note.title || 'ไม่มีชื่อ', query)}
               </strong>
-              <span title={note.content || 'ยังไม่มีเนื้อหา'}>
+              <span data-tooltip={note.content || 'ยังไม่มีเนื้อหา'}>
                 {renderSearchHighlight(note.content || 'ยังไม่มีเนื้อหา', query)}
               </span>
               <small
-                className="note-sync-row"
-                title={`${note.syncStatus === 'synced' ? 'ซิงก์แล้ว' : 'รอซิงก์'} · แก้ไขล่าสุด ${formatDate(note.updatedAt)}`}
+                className={`note-sync-row is-${noteBadgeStatus(note, syncState)}`}
+                data-tooltip={`${NOTE_BADGE_TITLE[noteBadgeStatus(note, syncState)]} · แก้ไขล่าสุด ${formatDate(note.updatedAt)}`}
               >
-                <SyncStatusIcon synced={note.syncStatus === 'synced'} />
-                <span
-                  className="sync-label"
-                  title={note.syncStatus === 'synced' ? 'ซิงก์แล้ว (synced)' : 'รอซิงก์ (pending)'}
-                >
-                  {note.syncStatus === 'synced' ? 'synced' : 'pending'}
+                <SyncStatusIcon status={noteBadgeStatus(note, syncState)} />
+                <span className="sync-label">
+                  {NOTE_BADGE_LABEL[noteBadgeStatus(note, syncState)]}
                 </span>
                 <span className="sync-separator" aria-hidden="true">·</span>
-                <time dateTime={note.updatedAt} title={`แก้ไขล่าสุด ${formatDate(note.updatedAt)}`}>
+                <time dateTime={note.updatedAt}>
                   {formatDate(note.updatedAt)}
                 </time>
               </small>
@@ -4022,6 +4421,7 @@ export default function App() {
             </button>
             </div>
             <div
+              ref={noteCanvasRef}
               className="note-canvas-viewport"
               onWheel={(event) => {
                 if (!event.ctrlKey) return;
@@ -4306,6 +4706,7 @@ export default function App() {
       </main>
       {formatContextMenuPortal}
       {findPanelPortal}
+      <CustomTooltip />
     </>
   );
 }

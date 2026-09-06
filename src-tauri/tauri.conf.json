@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "CloudPad",
-  "version": "0.6.76",
+  "version": "0.6.91",
   "identifier": "com.cloudpad.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -30,7 +30,7 @@
     "targets": ["nsis"],
     "publisher": "CloudPad",
     "homepage": "https://drive.google.com/drive/folders/1GJXNIPLtO5VnS0SPS4heBSkL0gNKzFbZ",
-    "copyright": "Copyright © 2026 CloudPad. All rights reserved.",
+    "copyright": "Copyright ยฉ 2026 CloudPad. All rights reserved.",
     "license": "MIT",
     "category": "Productivity",
     "shortDescription": "Offline-first notepad with cloud sync",

@@ -2,8 +2,10 @@ import { useCallback, useEffect, useState } from 'react';
 import type { User } from '@supabase/supabase-js';
 import { isCloudEnabled } from '../../cloud/supabase';
 import {
+  confirmPasswordReset,
   getCurrentUser,
   onAuthStateChange,
+  requestPasswordReset,
   signIn,
   signOut,
   signUp
@@ -68,6 +70,34 @@ export function useAuthStore() {
     }
   }, []);
 
+  const requestReset = useCallback(async (emailAddress: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      await requestPasswordReset(emailAddress);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'ส่งอีเมลรีเซ็ตรหัสผ่านไม่สำเร็จ');
+      throw reason;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const confirmReset = useCallback(async (emailAddress: string, otp: string, newPassword: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const nextUser = await confirmPasswordReset(emailAddress, otp, newPassword);
+      setUser(nextUser);
+      return nextUser;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'ตั้งรหัสผ่านใหม่ไม่สำเร็จ');
+      throw reason;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   const logout = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -90,6 +120,8 @@ export function useAuthStore() {
     clearError: () => setError(null),
     login,
     register,
-    logout
+    logout,
+    requestPasswordReset: requestReset,
+    confirmPasswordReset: confirmReset
   };
 }

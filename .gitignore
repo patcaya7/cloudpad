@@ -1,8 +1,9 @@
 node_modules
 dist
 .env
+.env.test
 src-tauri/.keys/
-src-tauri/tauri.updater.generated.conf.json
 src-tauri/target
 .DS_Store
 *.log
+.claude/

@@ -11,16 +11,16 @@
   box-sizing: border-box;
 }
 
+/* No horizontal minimum: the app-shell below is scaled by --app-zoom, so its
+   layout width is the window width DIVIDED by the zoom (900px window at 130%
+   zoom = 692px of layout). A fixed 900px floor here made the page itself wider
+   than the window in exactly that case — every click or keystroke then scrolled
+   the whole app sideways and clipped the sidebar / the start of each line. The
+   grid tracks below shrink on their own, so the layout simply fits instead. */
 body {
   margin: 0;
-  min-width: 900px;
-  min-height: 100vh;
-}
-
-/* The find / replace window is far smaller than the main app window; the 900px
-   minimum above would force horizontal overflow when it is zoomed below 100%. */
-body:has(.find-window-root) {
   min-width: 0;
+  min-height: 100vh;
 }
 
 button,
@@ -33,7 +33,11 @@ select {
 .app-shell {
   --app-zoom: 1;
   display: grid;
-  grid-template-columns: clamp(280px, 27vw, 320px) 1fr;
+  /* Percentages resolve against the shell, so the sidebar keeps its share of the
+     ZOOMED layout width; vw units would keep measuring the unscaled window and
+     hand the sidebar an ever bigger slice as the app is zoomed in. minmax(0, …)
+     lets both tracks shrink instead of overflowing on a narrow window. */
+  grid-template-columns: minmax(0, clamp(230px, 27%, 320px)) minmax(0, 1fr);
   width: calc(100% / var(--app-zoom));
   height: calc(100vh / var(--app-zoom));
   overflow: hidden;
@@ -423,7 +427,7 @@ select {
   display: inline-flex;
   align-items: center;
   flex: 0 0 auto;
-  width: auto;
+  width: fit-content;
   min-width: 0;
   max-width: min(100%, 720px);
   border-radius: 999px;
@@ -433,9 +437,7 @@ select {
   font-size: 13px;
   font-weight: 700;
   overflow: hidden;
-  contain: layout paint;
   transition:
-    width 220ms ease,
     color 180ms ease,
     background-color 180ms ease;
 }
@@ -472,21 +474,6 @@ select {
   line-height: 1.35;
 }
 
-/* Invisible twin of the status pill, used only to measure the natural width a
-   given message needs. It sits outside document flow (position: absolute) so it
-   never affects the topbar's flex layout, and always renders at its true content
-   width since nothing here constrains it — unlike the visible pill, which is
-   deliberately width-locked so its own resize can animate smoothly. */
-.status-pill-measurer {
-  position: absolute;
-  left: -9999px;
-  top: -9999px;
-  width: auto;
-  visibility: hidden;
-  pointer-events: none;
-  transition: none;
-}
-
 @keyframes status-pill-pulse {
   0%,
   100% {
@@ -501,7 +488,12 @@ select {
 
 .actions {
   display: flex;
+  /* Wrap instead of running off the edge: the toolbar has to survive a narrow
+     window AND an app zoom that shrinks the layout width (900px window at 130%
+     leaves 692px), otherwise "แผ่น %" and Sync Now end up outside the app. */
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 10px;
 }
 
@@ -895,20 +887,39 @@ select {
     0 8px 24px rgba(23, 32, 51, 0.045);
 }
 
+/* The note body is a sheet of FIXED layout width, scaled to fit the pane
+   (--note-fit, measured in App.tsx) times the manual "แผ่น %" (--note-zoom).
+   Text therefore always breaks at the same place: resizing the window or the
+   sidebar changes how big the sheet is drawn, never how many lines it takes. */
 .note-canvas-viewport > .content-input {
   --note-zoom: 1;
+  --note-fit: 1;
+  --note-sheet-scale: calc(var(--note-fit) * var(--note-zoom));
   display: block;
   flex: none;
-  width: calc(100% / var(--note-zoom));
-  min-height: calc(100% / var(--note-zoom));
+  width: var(--note-sheet-width, 880px);
+  /* Plain 100%: under `zoom` a percentage already resolves in the sheet's own
+     scaled coordinate space, so dividing by the scale (as the old transform-based
+     rule had to) would make the sheet 1/scale times too tall and leave the pane
+     scrollable even for a one-line note. */
+  min-height: 100%;
   max-height: none;
   padding: 26px 28px;
+  /* Auto margins centre the sheet once the fit hits its ceiling on a very wide
+     pane; below that the sheet fills the pane exactly and they resolve to 0. */
+  margin-inline: auto;
   overflow: visible;
+  /* Same reason as .cm-scroller below: a reserved gutter is a fixed number of
+     SCREEN pixels, so it eats a different slice of the sheet at every scale and
+     the wrap width would drift. The pane outside the sheet keeps its gutter. */
+  scrollbar-gutter: auto;
   border: 0;
   border-radius: 0;
   box-shadow: none;
-  transform: scale(var(--note-zoom));
-  transform-origin: top left;
+  /* `zoom`, not `transform: scale()`: zoom scales the LAID-OUT size too, so the
+     pane's scroll area matches what is drawn. With a transform the sheet still
+     occupied its full unscaled width, leaving a permanent horizontal scrollbar. */
+  zoom: var(--note-sheet-scale);
   caret-color: #0f172a;
 }
 
@@ -927,6 +938,13 @@ select {
 .codemirror-note-editor {
   position: relative;
   flex: 1;
+  /* A flex item's default min-width is "auto", i.e. it won't shrink below its
+     unwrapped content width. For plain text the browser can usually find a
+     break point, but a long run of emoji with no spaces often has none —
+     so the item (and the line) stayed as wide as the whole run and the
+     viewport scrolled sideways instead of wrapping. min-width: 0 lets the
+     flex item shrink to the container width so pre-wrap/word-break can wrap. */
+  min-width: 0;
   width: 100%;
   min-height: 100%;
 }
@@ -936,16 +954,20 @@ select {
   z-index: 2147483647;
   top: 0;
   left: 0;
-  width: 2px;
+  /* Keep this as a real, rendered native text control.  Windows Emoji Panel
+     can ignore an opacity:0 / zero-area target after a couple of selections. */
+  width: 1px;
   height: 24px;
-  min-width: 2px;
+  min-width: 1px;
   min-height: 18px;
   padding: 0;
   margin: 0;
   border: 0;
   outline: 0;
   overflow: hidden;
-  opacity: 0;
+  opacity: 0.01;
+  font-size: 1px;
+  line-height: 1px;
   color: transparent;
   background: transparent;
   caret-color: transparent;
@@ -964,8 +986,13 @@ select {
   outline: none;
 }
 
+/* No reserved scrollbar gutter inside the sheet. The sheet grows with its text
+   and the PANE does the scrolling, so this gutter never held a scrollbar — but
+   it is an OS-sized strip, i.e. a constant number of screen pixels, which is a
+   VARYING number of sheet pixels once the sheet is scaled. That made the wrap
+   width drift by a few percent between window sizes and could move a line break. */
 .codemirror-note-editor .cm-scroller {
-  scrollbar-gutter: stable;
+  scrollbar-gutter: auto;
 }
 
 .note-canvas-viewport::-webkit-scrollbar {
@@ -1082,6 +1109,21 @@ select {
   width: 100%;
 }
 
+.link-button {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  text-align: left;
+}
+
+.link-button:hover {
+  text-decoration: underline;
+}
+
 .account-email,
 .account-help,
 .account-error,
@@ -1107,6 +1149,101 @@ select {
 
 .account-success {
   color: #067647;
+}
+
+.sync-interval-setting {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 11px;
+  border: 1px solid #dbe2ee;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.sync-interval-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #344054;
+}
+
+.sync-interval-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.sync-interval-select {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #d0d7e2;
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #f8faff;
+  color: #1d2939;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+}
+
+.sync-interval-select:focus {
+  border-color: #1d4ed8;
+  box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.1);
+}
+
+.sync-interval-save {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  font-size: 13px;
+}
+
+.sync-interval-save:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.sync-interval-current {
+  color: #667085;
+}
+
+.emoji-bridge-setting {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 10px 11px;
+  border: 1px solid #dbe2ee;
+  border-radius: 12px;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.emoji-bridge-setting input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  flex: 0 0 auto;
+  accent-color: #1d4ed8;
+  cursor: pointer;
+}
+
+.emoji-bridge-setting__text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.emoji-bridge-setting__text strong {
+  font-size: 12px;
+  font-weight: 700;
+  color: #344054;
+}
+
+.emoji-bridge-setting__text small {
+  font-size: 11px;
+  line-height: 1.4;
+  color: #667085;
 }
 
 .status-group {
@@ -1137,7 +1274,10 @@ button:active:not(:disabled) {
 }
 
 .app-shell {
-  grid-template-columns: clamp(320px, 31.5vw, 380px) 1fr;
+  /* Same reasoning as the base rule near the top of this file: size the sidebar
+     against the shell (a percentage) rather than the window (vw), and let both
+     tracks shrink so a narrow or zoomed-in window fits instead of overflowing. */
+  grid-template-columns: minmax(0, clamp(230px, 31.5%, 380px)) minmax(0, 1fr);
   border: 1px solid #e0e6ef;
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.76);
@@ -1582,7 +1722,9 @@ button:active:not(:disabled) {
   display: flex;
   min-height: 0;
   flex-direction: column;
-  align-items: stretch;
+  /* จัดกึ่งกลางแทนการยืดเต็มความกว้าง เพื่อเว้นที่ว่างข้างๆ ให้ปุ่มขยายตอน hover
+     ได้โดยไม่โดน overflow-x: hidden ตัดขอบ */
+  align-items: center;
   gap: 3px;
   overflow-x: hidden;
   overflow-y: auto;
@@ -1598,14 +1740,16 @@ button:active:not(:disabled) {
   position: relative;
   display: grid;
   place-items: center;
+  /* แคบกว่าความกว้างแถบ (34px) เพื่อเหลือที่ให้ scale ตอน hover โดยไม่โดนตัดขอบ */
+  width: 24px;
   min-height: 27px;
   padding: 3px 2px;
   border: 1px solid transparent;
   border-radius: 9px;
-  color: #526078;
+  color: #334155;
   background: transparent;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 900;
   line-height: 1;
   transform: translateX(0) scale(1);
@@ -1626,16 +1770,18 @@ button:active:not(:disabled) {
   writing-mode: vertical-rl;
 }
 
+/* ปุ่มกว้าง 24px อยู่กลางแถบกว้าง 32px (หักขอบใน) จึงเหลือข้างละ 4px
+   scale ได้ถึง ~1.3 (24 -> 31.2px) โดยยังไม่ล้นออกนอกแถบ */
 .note-alphabet-index button:hover {
   border-color: #c9d8ff;
   color: #1d4ed8;
   background: #edf3ff;
   box-shadow: 0 4px 10px rgba(37, 99, 235, 0.14);
-  transform: translateX(2px) scale(1.06);
+  transform: scale(1.3);
 }
 
 .note-alphabet-index button:active {
-  transform: translateX(2px) scale(0.97);
+  transform: scale(1.16);
 }
 
 .note-alphabet-index button.active {
@@ -1651,7 +1797,7 @@ button:active:not(:disabled) {
   color: #ffffff;
   background: #1d4ed8;
   box-shadow: 0 5px 13px rgba(29, 78, 216, 0.28);
-  transform: translateX(2px) scale(1.06);
+  transform: scale(1.3);
 }
 
 @keyframes alphabet-choice-in {
@@ -1940,10 +2086,10 @@ button:active:not(:disabled) {
 .note-card > span:not(.note-pin-indicator),
 .note-card .note-preview {
   overflow: hidden;
-  color: #475569;
-  font-size: 12px;
+  color: #26364d;
+  font-size: 12.5px;
   font-weight: 700;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.005em;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
@@ -1953,10 +2099,10 @@ button:active:not(:disabled) {
   display: flex;
   align-items: center;
   gap: 5px;
-  color: #64748b;
-  font-size: 11.5px;
+  color: #33415a;
+  font-size: 12px;
   font-weight: 800;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.005em;
 }
 
 .note-sync-row {
@@ -1976,11 +2122,49 @@ button:active:not(:disabled) {
   width: 16px;
   height: 16px;
   flex: 0 0 16px;
-  color: #42c879;
+  color: #16a34a;
+  transition: color .2s ease;
 }
 
 .sync-status-icon.pending {
-  color: #f59e0b;
+  color: #c2740a;
+}
+
+.sync-status-icon.syncing {
+  color: #1d4ed8;
+  animation: sync-icon-spin .9s linear infinite;
+  transform-origin: 50% 50%;
+}
+
+/* Pending is a live "waiting to upload" state, not a dead end — breathe the dot so
+   the card reads as working rather than frozen. */
+.sync-status-icon.pending .sync-status-icon-dot {
+  animation: sync-dot-pulse 1.6s ease-in-out infinite;
+  transform-origin: 50% 50%;
+}
+
+.note-sync-row.is-pending .sync-label {
+  color: #a15c04;
+}
+
+.note-sync-row.is-syncing .sync-label {
+  color: #1d4ed8;
+}
+
+@keyframes sync-icon-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes sync-dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .35; transform: scale(.6); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sync-status-icon.syncing,
+  .sync-status-icon.pending .sync-status-icon-dot {
+    animation: none;
+  }
 }
 
 .sync-label,
@@ -1993,7 +2177,44 @@ button:active:not(:disabled) {
 }
 
 .sync-separator {
-  color: #a6b0c0;
+  color: #7c8aa0;
+}
+
+/* Themed replacement for the browser's native title tooltip (see CustomTooltip). */
+.custom-tooltip {
+  position: fixed;
+  z-index: 2147483000;
+  max-width: 340px;
+  max-height: 42vh;
+  overflow: hidden;
+  padding: 9px 12px 9px 13px;
+  border-radius: 11px;
+  border: 1px solid #cfdbf0;
+  border-left: 3px solid #1d4ed8;
+  background: linear-gradient(180deg, #ffffff, #f6faff);
+  color: #1e293b;
+  box-shadow: 0 12px 34px rgba(23, 42, 89, 0.18), 0 3px 10px rgba(23, 42, 89, 0.08);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.55;
+  letter-spacing: -0.005em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  pointer-events: none;
+  animation: custom-tooltip-in 0.13s ease-out;
+}
+
+@keyframes custom-tooltip-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .custom-tooltip {
+    animation: none;
+  }
 }
 
 .account-card {
@@ -2085,7 +2306,7 @@ button:active:not(:disabled) {
 
 .status-pill {
   margin-left: 0;
-  padding: 10px 15px;
+  padding: 5px 11px;
   color: #0d9a55;
   background: #eaf8ef;
   font-size: 12px;
@@ -2093,7 +2314,7 @@ button:active:not(:disabled) {
 
 .status-pill::before {
   flex: 0 0 auto;
-  margin-right: 8px;
+  margin-right: 6px;
   content: "●";
   font-size: 9px;
 }
@@ -2350,7 +2571,7 @@ button:active:not(:disabled) {
 
 @media (max-width: 1050px) {
   .app-shell {
-    grid-template-columns: 320px 1fr;
+    grid-template-columns: minmax(0, clamp(230px, 34%, 320px)) minmax(0, 1fr);
   }
 
   .format-toolbar {
@@ -3171,9 +3392,13 @@ button:active:not(:disabled) {
     transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+/* max-height ต้องสูงพอสำหรับเนื้อหาที่ยาวที่สุด (ตอนล็อกอินแล้ว + มีข้อความผิดพลาด
+   + ข้อความอธิบายตัดขึ้นบรรทัดใหม่) ไม่งั้นเนื้อหาท้ายกล่องจะโดนตัดหาย
+   คิดจากความสูงจอเหมือน .app-shell เพื่อให้ยังพอดีตอนซูมและตอนหน้าต่างเตี้ย */
 .account-hover-zone:hover > .account-card,
 .account-hover-zone:focus-within > .account-card {
-  max-height: 320px;
+  max-height: calc((100vh / var(--app-zoom)) - 130px);
+  overflow-y: auto;
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0);

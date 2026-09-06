@@ -45,13 +45,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build Tauri installer and update artifacts (NSIS)
-        run: npm run tauri:build:update
+      - name: Build normal Tauri installer (NSIS)
+        run: npm run tauri:build
         env:
           # Supabase keys come from repo secrets, NOT from a committed .env.
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
 
       - name: Upload unsigned installer
         id: upload
@@ -59,13 +58,6 @@ jobs:
         with:
           name: cloudpad-installer-unsigned
           path: src-tauri/target/release/bundle/nsis/*-setup.exe
-          if-no-files-found: error
-
-      - name: Upload updater artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: cloudpad-updater-artifacts
-          path: src-tauri/target/release/bundle/nsis/*.nsis.zip*
           if-no-files-found: error
 
   sign:
@@ -106,19 +98,7 @@ jobs:
           name: cloudpad-installer-signed
           path: signed
 
-      - name: Download updater artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: cloudpad-updater-artifacts
-          path: updater
-
-      - name: Create update manifest
-        run: node scripts/create-update-manifest.mjs updater latest.json
-        env:
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-
-      - name: Publish release and update link
-        run: gh release create "$GITHUB_REF_NAME" signed/* updater/* latest.json --title "CloudPad $GITHUB_REF_NAME" --generate-notes
+      - name: Publish normal installer release
+        run: gh release create "$GITHUB_REF_NAME" signed/* --title "CloudPad $GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

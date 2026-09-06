@@ -62,8 +62,8 @@ src-tauri/target/release/bundle/nsis/
 
 ## Code signing and downloads
 
-CloudPad release installers are built with GitHub Actions and submitted to the
-SignPath Foundation for code signing. Signed installers and release notes are
-published on the project's GitHub Releases page.
+CloudPad ใช้ไฟล์ติดตั้ง Windows แบบปกติ (NSIS) โดยไม่มีระบบตรวจหา
+หรือดาวน์โหลดอัปเดตจากภายในแอป ผู้ใช้ติดตั้งรุ่นใหม่ด้วยไฟล์ติดตั้งตามปกติ
+เช่นเดียวกับคลังความรู้
 
 See [Privacy Policy](PRIVACY.md) for how CloudPad handles user data.

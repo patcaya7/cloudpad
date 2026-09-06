@@ -2,6 +2,7 @@ import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
 import type { CSSProperties } from 'react';
 import { defaultKeymap, indentWithTab } from '@codemirror/commands';
 import { searchKeymap } from '@codemirror/search';
+import { writeText as writeNativeClipboardText } from '@tauri-apps/plugin-clipboard-manager';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { EditorSelection, EditorState, RangeSetBuilder, StateEffect, StateField, type SelectionRange } from '@codemirror/state';
 import {
@@ -116,6 +117,12 @@ interface DetectedLink {
 const WEB_LINK_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"']+/giu;
 const EMAIL_LINK_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/giu;
 const TRAILING_LINK_PUNCTUATION = /[.,;:!?}\]]+$/u;
+// Text that arrives in the hidden Windows input bridge is only proof of a real
+// emoji panel when it actually contains a pictograph. Plain characters mean the
+// bridge is swallowing ordinary typing (it was armed by a Windows key press that
+// turned out to be Win+Space, a Start-menu tap, ...) and focus must go straight
+// back to the editor, otherwise the caret stays invisible while typing works.
+const EMOJI_LIKE_PATTERN = /\p{Extended_Pictographic}/u;
 
 function normalizeDetectedLink(value: string): string | null {
   const trimmed = value.replace(TRAILING_LINK_PUNCTUATION, '');
@@ -170,6 +177,19 @@ async function openDetectedLink(url: string): Promise<void> {
 // Consecutive typing/deletion within this window collapses into one undo step
 // so Ctrl+Z reverts a burst of text instead of a single character at a time.
 const TYPING_UNDO_GROUP_MS = 400;
+
+// The Windows emoji-picker bridge is opt-in via Settings. Some Windows WebViews
+// swallow the Period key before JavaScript can see it, so the enabled compatibility
+// path must prepare the native text target on the Windows key itself.
+const EMOJI_INPUT_BRIDGE_STORAGE_KEY = 'cloudpad.emojiBridge.v1';
+
+function isEmojiInputBridgeEnabled(): boolean {
+  try {
+    return localStorage.getItem(EMOJI_INPUT_BRIDGE_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
 
 // In-app rich clipboard: remembers the formatting (colour/weight/size/font) of the
 // last copied/cut selection, keyed by its plain text, so pasting that same text back
@@ -261,6 +281,13 @@ const imageTokenPlugin = ViewPlugin.fromClass(
   }
 );
 const EMOJI_TRACE_STORAGE_KEY = 'cloudpad:emoji-input-trace';
+// Trace logging is opt-in even in dev builds — it used to fire unconditionally
+// on every beforeinput/input event (2+ sessionStorage round-trips and 2 console
+// calls per keystroke), which starved the browser of paint time during OS key
+// repeat: held keys looked frozen and dumped all characters at once on release.
+// Flip this on in the DevTools console only while actively reproducing a
+// Windows emoji/IME bug: sessionStorage.setItem('cloudpad:emoji-trace-enabled', '1')
+const EMOJI_TRACE_ENABLED_KEY = 'cloudpad:emoji-trace-enabled';
 
 function traceWindowsEmojiInput(
   source: string,
@@ -269,6 +296,7 @@ function traceWindowsEmojiInput(
   singleLine: boolean
 ) {
   if (!import.meta.env.DEV) return;
+  if (sessionStorage.getItem(EMOJI_TRACE_ENABLED_KEY) !== '1') return;
   const inputEvent = event instanceof InputEvent ? event : null;
   const keyboardEvent = event instanceof KeyboardEvent ? event : null;
   const compositionEvent = event instanceof CompositionEvent ? event : null;
@@ -297,6 +325,7 @@ function traceWindowsEmojiInput(
       EMOJI_TRACE_STORAGE_KEY,
       JSON.stringify([...previous.slice(-79), record])
     );
+    console.debug('[CloudPad emoji]', JSON.stringify(record));
   } catch {
     sessionStorage.setItem(EMOJI_TRACE_STORAGE_KEY, JSON.stringify([record]));
   }
@@ -683,6 +712,23 @@ function buildExternalPasteHtml(text: string): string | null {
   return html.replace(/\n/g, '<br />');
 }
 
+// The synchronous ClipboardEvent write above is enough for an immediate paste
+// (here or in another app) to see the new text, but on Windows it never
+// reaches Clipboard History (Win+V): WebView2's JS clipboard implementation
+// (both the sync ClipboardEvent API and the async navigator.clipboard one)
+// does not go through the normal OpenClipboard/SetClipboardData ownership
+// sequence, so Windows never sees a real clipboard-owner change to record.
+// Tauri's clipboard-manager plugin writes through Rust instead, which uses
+// the real Win32 clipboard APIs — so route the write through that when
+// running inside the desktop app, and fall back to the browser API in the
+// plain web preview (no Tauri runtime there).
+function notifyWindowsClipboardHistory(text: string) {
+  if (!text) return;
+  void writeNativeClipboardText(text).catch(() => {
+    void navigator.clipboard?.writeText(text).catch(() => {});
+  });
+}
+
 function normalizeBoldRanges(ranges: BoldRange[], docLength: number): BoldRange[] {
   return mergeStyleRanges(ranges, docLength);
 }
@@ -1048,8 +1094,18 @@ const editorTheme = EditorView.theme({
   },
   '.cm-content': {
     minHeight: '100%',
+    // .cm-content is a flex item of .cm-scroller (CodeMirror's own base theme:
+    // flexGrow 2 / flexShrink 1 when wrapping is on). A flex item's default
+    // min-width is "auto" — its unwrapped content width — and unlike
+    // overflow-wrap: anywhere, word-break: break-word does not shrink that
+    // intrinsic size. Long unbroken runs (emoji strings, repeated letters
+    // with no spaces) therefore stayed as wide as the whole run and the
+    // editor scrolled sideways instead of wrapping. min-width: 0 lets the
+    // item actually shrink to the available width so wrapping can kick in.
+    minWidth: '0',
     caretColor: '#1d4ed8',
     whiteSpace: 'pre-wrap',
+    overflowWrap: 'anywhere',
     wordBreak: 'break-word'
   },
   '.cm-line': {
@@ -1127,15 +1183,6 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
     const emojiBridgeSelectionRef = useRef<EditorSelection | null>(null);
     const emojiBridgeActiveRef = useRef(false);
     const emojiBridgeCommitTimerRef = useRef<number | null>(null);
-    // How long a pre-armed bridge waits for the window blur that a real panel
-    // (emoji picker / clipboard history / start menu) causes. If no blur comes,
-    // the Win press wasn't a panel shortcut and focus goes straight back.
-    const WIN_EMOJI_NO_BLUR_RESTORE_MS = 600;
-    // Timestamp of the last Windows/Meta key press. The emoji bridge only steals
-    // focus on a window blur that follows a recent Win press (i.e. the Win+. emoji
-    // picker) — plain alt-tab / click-away / spurious OS blur must NOT disturb editing.
-    const lastMetaKeyDownAtRef = useRef(0);
-    const WIN_EMOJI_BLUR_WINDOW_MS = 1500;
 
     useEffect(() => {
       onChangeRef.current = onChange;
@@ -1875,6 +1922,8 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
       if (!hostRef.current || viewRef.current) return;
       let stopCtrlDragTracking: (() => void) | null = null;
       let stopNativeCtrlDoubleClickTracking: (() => void) | null = null;
+      let textDragArmTimer: number | null = null;
+      let isTextDragArmed = false;
 
       const keepUsefulRanges = (selection: EditorSelection) => {
         return selection.ranges;
@@ -1892,6 +1941,39 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
 
       const posFromMouseEvent = (view: EditorView, event: MouseEvent) => {
         return view.posAtCoords({ x: event.clientX, y: event.clientY }) ?? view.state.selection.main.head;
+      };
+
+      // A selected word can otherwise start a native drag after just a tiny pointer
+      // movement. Arm drag-to-move only after a short deliberate press.
+      const cancelTextDragArm = () => {
+        if (textDragArmTimer !== null) {
+          window.clearTimeout(textDragArmTimer);
+          textDragArmTimer = null;
+        }
+        isTextDragArmed = false;
+      };
+
+      const armTextDrag = (view: EditorView, event: MouseEvent) => {
+        cancelTextDragArm();
+        if (
+          event.button !== 0
+          || event.detail !== 1
+          || event.ctrlKey
+          || event.metaKey
+          || event.altKey
+          || event.shiftKey
+        ) return;
+
+        const position = posFromMouseEvent(view, event);
+        const startsInsideSelection = view.state.selection.ranges.some(
+          (range) => !range.empty && position >= range.from && position <= range.to
+        );
+        if (!startsInsideSelection) return;
+
+        textDragArmTimer = window.setTimeout(() => {
+          textDragArmTimer = null;
+          isTextDragArmed = true;
+        }, 180);
       };
 
       const startCtrlDragSelection = (view: EditorView, event: MouseEvent) => {
@@ -2143,6 +2225,9 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
               const richText = richRange ? view.state.sliceDoc(richRange.from, richRange.to) : '';
               captureRichClipboard(view, richRange, richText);
 
+              const plainText = safe ? safe.text : richText;
+              if (!plainText) return false;
+
               // A selection that mixes an image token with other content (e.g. an
               // image plus a caption): native copy would only ever carry the raw
               // "[ภาพ:id]" text, so an app outside CloudPad shows that literal
@@ -2150,31 +2235,21 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
               // real <img> in it so paste targets that understand HTML show the
               // image; text/plain keeps the token so pasting back into CloudPad
               // still works exactly as before.
-              const externalHtml = buildExternalPasteHtml(safe ? safe.text : richText);
-              if (externalHtml) {
-                event.preventDefault();
-                event.clipboardData?.setData('text/plain', safe ? safe.text : richText);
-                event.clipboardData?.setData('text/html', externalHtml);
-                if (safe) {
-                  view.dispatch({
-                    selection: EditorSelection.create(
-                      safe.ranges.map((range) => EditorSelection.range(range.from, range.to)),
-                      safe.ranges.length - 1
-                    )
-                  });
-                }
-                return true;
-              }
-
-              if (!safe) return false;
-              event.clipboardData?.setData('text/plain', safe.text);
+              const externalHtml = buildExternalPasteHtml(plainText);
               event.preventDefault();
-              view.dispatch({
-                selection: EditorSelection.create(
-                  safe.ranges.map((range) => EditorSelection.range(range.from, range.to)),
-                  safe.ranges.length - 1
-                )
-              });
+              event.clipboardData?.setData('text/plain', plainText);
+              if (externalHtml) {
+                event.clipboardData?.setData('text/html', externalHtml);
+              }
+              notifyWindowsClipboardHistory(plainText);
+              if (safe) {
+                view.dispatch({
+                  selection: EditorSelection.create(
+                    safe.ranges.map((range) => EditorSelection.range(range.from, range.to)),
+                    safe.ranges.length - 1
+                  )
+                });
+              }
               return true;
             },
             cut: (event, view) => {
@@ -2188,28 +2263,22 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
               const richText = richRange ? view.state.sliceDoc(richRange.from, richRange.to) : '';
               captureRichClipboard(view, richRange, richText);
 
+              const plainText = safe ? safe.text : richText;
+              const cutRanges = safe ? safe.ranges : (richRange ? [richRange] : null);
+              if (!plainText || !cutRanges) return false;
+
               // See the matching comment in `copy`: give apps outside CloudPad an
               // actual <img> to paste instead of the raw "[ภาพ:id]" token text.
-              const externalHtml = buildExternalPasteHtml(safe ? safe.text : richText);
-              if (externalHtml && richRange) {
-                event.preventDefault();
-                event.clipboardData?.setData('text/plain', safe ? safe.text : richText);
-                event.clipboardData?.setData('text/html', externalHtml);
-                const cutRanges = safe ? safe.ranges : [richRange];
-                view.dispatch({
-                  changes: cutRanges.map((range) => ({ from: range.from, to: range.to, insert: '' })),
-                  selection: EditorSelection.cursor(cutRanges[0].from),
-                  userEvent: 'delete.cut'
-                });
-                return true;
-              }
-
-              if (!safe) return false;
-              event.clipboardData?.setData('text/plain', safe.text);
+              const externalHtml = buildExternalPasteHtml(plainText);
               event.preventDefault();
+              event.clipboardData?.setData('text/plain', plainText);
+              if (externalHtml) {
+                event.clipboardData?.setData('text/html', externalHtml);
+              }
+              notifyWindowsClipboardHistory(plainText);
               view.dispatch({
-                changes: safe.ranges.map((range) => ({ from: range.from, to: range.to, insert: '' })),
-                selection: EditorSelection.cursor(safe.ranges[0].from),
+                changes: cutRanges.map((range) => ({ from: range.from, to: range.to, insert: '' })),
+                selection: EditorSelection.cursor(cutRanges[0].from),
                 userEvent: 'delete.cut'
               });
               return true;
@@ -2261,9 +2330,22 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
             mousedown: (event, view) => {
               if (event.detail >= 2 && ctrlDoubleClickSelectWord(view, event)) return true;
               if (startCtrlDragSelection(view, event)) return true;
+              armTextDrag(view, event);
               if (event.button === 0 && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
                 lastNonEmptySelectionRangesRef.current = [];
               }
+              return false;
+            },
+            dragstart: (event) => {
+              if (!isTextDragArmed) {
+                event.preventDefault();
+                return true;
+              }
+              cancelTextDragArm();
+              return false;
+            },
+            dragend: () => {
+              cancelTextDragArm();
               return false;
             },
             dblclick: (event, view) => {
@@ -2275,6 +2357,7 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
               return false;
             },
             mouseup: (_event, view) => {
+              cancelTextDragArm();
               window.setTimeout(() => emitBoldStateForSelection(view), 0);
               return false;
             },
@@ -2283,6 +2366,14 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
               return false;
             },
             focus: () => {
+              // A normal click back into the note ends the previous native-picker
+              // session. Do not leave its bridge marked active, otherwise the next
+              // Win+. would skip its fresh selection/target setup.
+              if (emojiBridgeActiveRef.current && document.activeElement !== emojiBridge) {
+                emojiBridgeActiveRef.current = false;
+                emojiBridgeSelectionRef.current = null;
+                suspendExternalSyncRef.current = false;
+              }
               onFocusRef.current?.();
               return false;
             },
@@ -2401,84 +2492,184 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
 
       const emojiBridge = emojiInputBridgeRef.current;
 
+      // Backstop for a Windows key press that armed the bridge but never opened a
+      // panel (see handleSystemShortcutKeyUp).
+      let windowsKeyRestoreTimer: number | null = null;
+
       const clearEmojiBridgeTimers = () => {
         if (emojiBridgeCommitTimerRef.current !== null) {
           window.clearTimeout(emojiBridgeCommitTimerRef.current);
           emojiBridgeCommitTimerRef.current = null;
         }
-      };
-
-      let emojiPreArmRestoreTimer: number | null = null;
-
-      const cancelEmojiPreArmRestore = () => {
-        if (emojiPreArmRestoreTimer !== null) {
-          window.clearTimeout(emojiPreArmRestoreTimer);
-          emojiPreArmRestoreTimer = null;
+        if (windowsKeyRestoreTimer !== null) {
+          window.clearTimeout(windowsKeyRestoreTimer);
+          windowsKeyRestoreTimer = null;
         }
       };
 
+      // True only once we have POSITIVE proof a real emoji/clipboard panel opened:
+      // the keyup of Win+. / Win+; / Win+V leaked through, or text flowed into the
+      // bridge. A bare Windows tap (Start menu) never sets this, so its blur/refocus
+      // cycle must hand focus back to the editor instead of leaving the bridge stuck.
+      let emojiPanelConfirmed = false;
+      let languageSwitchPending = false;
+      // Keep the bridge value intact while Windows' picker is open. Some picker
+      // builds stop delivering later selections when the focused target is cleared
+      // after the first emoji, so this tracks the prefix already inserted instead.
+      let committedEmojiBridgeText = '';
+      // `beforeinput` / `input` tell us whether Windows changed its hidden
+      // target by inserting a picker result or by deleting a character. The
+      // latter must be mirrored as an editor deletion, never inserted again as
+      // a fresh string (which previously replayed the bridge history).
+      let lastEmojiBridgeInputType = '';
+
       const restoreEditorFromEmojiBridge = () => {
-        cancelEmojiPreArmRestore();
         if (!emojiBridgeActiveRef.current) return;
         const selection = emojiBridgeSelectionRef.current;
         emojiBridgeActiveRef.current = false;
         emojiBridgeSelectionRef.current = null;
+        emojiPanelConfirmed = false;
         emojiBridge?.blur();
         view.focus();
         if (selection) view.dispatch({ selection });
       };
 
-      // Undo a pre-arm when it turns out no panel is opening (window still has
-      // focus): hand focus straight back to the editor.
-      const restorePreArmedBridge = () => {
-        cancelEmojiPreArmRestore();
-        if (!emojiBridgeActiveRef.current || !document.hasFocus()) return;
-        suspendExternalSyncRef.current = false;
-        restoreEditorFromEmojiBridge();
+      const restoreEditorAfterAlt = () => {
+        if (emojiBridgeActiveRef.current) {
+          suspendExternalSyncRef.current = false;
+          restoreEditorFromEmojiBridge();
+          return;
+        }
+
+        // Windows/WebView can move focus to the document root while Alt opens
+        // the native menu. There may be no window focus event when the menu
+        // closes, so explicitly restore CodeMirror only when no other control
+        // is the user's active target.
+        if (!document.hasFocus()) return;
+        const activeElement = document.activeElement;
+        if (
+          activeElement === document.body
+          || activeElement === document.documentElement
+          || activeElement === emojiBridge
+        ) {
+          emojiBridge?.blur();
+          view.focus();
+        }
       };
 
       const commitEmojiBridgeText = () => {
         if (!emojiBridge || viewRef.current !== view) return;
         const rawText = emojiBridge.value;
+        const isBackwardDelete = lastEmojiBridgeInputType.startsWith('deleteContentBackward')
+          || lastEmojiBridgeInputType.startsWith('deleteWordBackward');
+        // Do not rely only on InputEvent.inputType. WebView2 builds used by the
+        // desktop app have been observed to emit an empty inputType for native
+        // Windows-picker edits. A strict prefix shrink is unambiguous: the
+        // bridge's accumulated value was shortened, so it is a deletion.
+        const deletedBridgeText = committedEmojiBridgeText.startsWith(rawText)
+          && rawText.length < committedEmojiBridgeText.length;
+
+        if (deletedBridgeText || isBackwardDelete) {
+          // The Windows picker keeps its own accumulated value. Backspace edits
+          // that value first, so translate the reduction into an actual editor
+          // deletion instead of treating the remaining bridge text as new input.
+          if (deletedBridgeText) {
+            const selection = emojiBridgeSelectionRef.current;
+            if (selection) view.dispatch({ selection });
+            const activeSelection = view.state.selection.main;
+            const removedLength = committedEmojiBridgeText.length - rawText.length;
+            const from = activeSelection.empty
+              ? Math.max(0, activeSelection.head - removedLength)
+              : activeSelection.from;
+            const to = activeSelection.empty ? activeSelection.head : activeSelection.to;
+            view.dispatch({
+              changes: { from, to, insert: '' },
+              userEvent: 'delete.backward'
+            });
+            emojiBridgeSelectionRef.current = view.state.selection;
+          }
+
+          committedEmojiBridgeText = rawText;
+          lastEmojiBridgeInputType = '';
+          suspendExternalSyncRef.current = false;
+          restoreEditorFromEmojiBridge();
+          return;
+        }
+
         if (!rawText) return;
+        const newText = rawText.startsWith(committedEmojiBridgeText)
+          ? rawText.slice(committedEmojiBridgeText.length)
+          : rawText;
+        if (!newText) return;
         const text = singleLine
-          ? rawText.replace(/\r\n?|\n/g, ' ')
-          : rawText.replace(/\r\n?/g, '\n');
+          ? newText.replace(/\r\n?|\n/g, ' ')
+          : newText.replace(/\r\n?/g, '\n');
         const selection = emojiBridgeSelectionRef.current;
 
-        emojiBridge.value = '';
         if (selection) view.dispatch({ selection });
         view.dispatch({
           ...view.state.replaceSelection(text),
           userEvent: 'input.type'
         });
+        committedEmojiBridgeText = rawText;
+        lastEmojiBridgeInputType = '';
         // Keep the native Windows text target active after each emoji. The
         // Windows picker stays open and may send more emoji without another
-        // Win+V/Win+. shortcut. Closing this bridge here made only the first
-        // emoji work.
+        // Win+V/Win+. shortcut. Do not focus it again when it is already the
+        // active target — repeated focus calls can detach the picker after the
+        // first selected emoji on some Windows builds.
         emojiBridgeSelectionRef.current = view.state.selection;
         emojiBridgeActiveRef.current = true;
-        emojiBridge.focus({ preventScroll: true });
+
+        // Plain text means the user is simply typing and the bridge is in the way
+        // (it was armed by a Windows key press with no emoji panel behind it, e.g.
+        // the Win+Space language switch). Hand the keyboard back to CodeMirror at
+        // the position the text just landed, so the caret becomes visible again.
+        if (!EMOJI_LIKE_PATTERN.test(text)) {
+          emojiBridge.value = '';
+          committedEmojiBridgeText = '';
+          suspendExternalSyncRef.current = false;
+          restoreEditorFromEmojiBridge();
+          return;
+        }
+
+        if (document.activeElement !== emojiBridge) {
+          emojiBridge.focus({ preventScroll: true });
+        }
       };
 
-      const scheduleEmojiBridgeCommit = () => {
+      const scheduleEmojiBridgeCommit = (event?: Event) => {
+        if (event instanceof InputEvent && event.inputType) {
+          lastEmojiBridgeInputType = event.inputType;
+        }
         traceWindowsEmojiInput('bridge-input', null, view, singleLine);
-        // Content is flowing into the bridge — never yank focus away from it.
-        cancelEmojiPreArmRestore();
+        // Emoji flowing into the bridge is a real emoji/clipboard panel: confirm it
+        // and never yank focus away from it. Plain characters are NOT proof — after
+        // a Win+Space language switch the bridge keeps the keyboard, so confirming
+        // here left the caret trapped in the bridge for the rest of the session
+        // (typing still landed in the note, but no cursor was ever drawn).
+        if (EMOJI_LIKE_PATTERN.test(emojiBridge?.value ?? '')) {
+          emojiPanelConfirmed = true;
+        }
         if (emojiBridgeCommitTimerRef.current !== null) {
           window.clearTimeout(emojiBridgeCommitTimerRef.current);
         }
         emojiBridgeCommitTimerRef.current = window.setTimeout(() => {
           emojiBridgeCommitTimerRef.current = null;
           commitEmojiBridgeText();
-        }, 12);
+        }, 35);
       };
 
-      const activateEmojiInputBridge = () => {
-        if (!emojiBridge || emojiBridgeActiveRef.current) return;
+      const activateEmojiInputBridge = (allowUnfocusedEditor = false) => {
+        if (!isEmojiInputBridgeEnabled()) return false;
+        if (!emojiBridge || emojiBridgeActiveRef.current) return false;
         const activeElement = document.activeElement;
-        if (!view.hasFocus && !(activeElement instanceof Node && view.dom.contains(activeElement))) {
-          return;
+        if (
+          !allowUnfocusedEditor
+          && !view.hasFocus
+          && !(activeElement instanceof Node && view.dom.contains(activeElement))
+        ) {
+          return false;
         }
 
         const cursor = view.coordsAtPos(view.state.selection.main.head);
@@ -2489,53 +2680,75 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
         }
 
         clearEmojiBridgeTimers();
+        emojiPanelConfirmed = false;
+        committedEmojiBridgeText = '';
+        lastEmojiBridgeInputType = '';
         emojiBridgeSelectionRef.current = view.state.selection;
         emojiBridgeActiveRef.current = true;
         emojiBridge.value = '';
         emojiBridge.focus({ preventScroll: true });
+        return true;
       };
 
       const handleSystemShortcutKeyDown = (event: KeyboardEvent) => {
-        if (event.key === 'Meta' || event.metaKey || event.code === 'MetaLeft' || event.code === 'MetaRight') {
-          lastMetaKeyDownAtRef.current = Date.now();
-          traceWindowsEmojiInput('window-keydown', event, view, singleLine);
-          if (event.key === 'Meta' || event.code === 'MetaLeft' || event.code === 'MetaRight') {
-            // Pre-arm the bridge on the Win press itself, BEFORE the emoji /
-            // clipboard panel opens: Windows binds the panel to whichever text
-            // control has focus at open time. Arming only after the blur meant
-            // the panel first bound to the editor, so the first emoji click was
-            // delivered to a no-longer-focused control and dropped — only the
-            // second click landed.
-            if (!emojiBridgeActiveRef.current) {
-              const activeElement = document.activeElement;
-              const editorFocused = view.hasFocus
-                || (activeElement instanceof Node && view.dom.contains(activeElement));
-              if (editorFocused) {
+        const isWindowsKey = event.key === 'Meta'
+          || event.code === 'MetaLeft'
+          || event.code === 'MetaRight';
+        const isAltKey = event.key === 'Alt'
+          || event.code === 'AltLeft'
+          || event.code === 'AltRight';
+        const isWindowsPanelShortcut = event.metaKey
+          && (event.code === 'Period' || event.code === 'Semicolon' || event.code === 'KeyV');
+
+        if (isAltKey) {
+          restoreEditorAfterAlt();
+          return;
+        }
+
+        if (isWindowsKey) {
+          traceWindowsEmojiInput('windows-keydown', event, view, singleLine);
+          // Windows chooses the picker insertion target before it exposes the
+          // Period key to WebView. This compatibility path is explicitly opt-in;
+          // when disabled, a bare Windows key never affects typing focus.
+          if (!emojiBridgeActiveRef.current) {
+            const activeElement = document.activeElement;
+            const editorFocused = view.hasFocus
+              || (activeElement instanceof Node && view.dom.contains(activeElement));
+            if (editorFocused) {
+              // Only suspend React/external synchronization after the bridge
+              // actually activated. When the setting is off, activation is a
+              // no-op and normal editor synchronization must remain untouched.
+              if (activateEmojiInputBridge()) {
                 suspendExternalSyncRef.current = true;
-                activateEmojiInputBridge();
-                cancelEmojiPreArmRestore();
-                emojiPreArmRestoreTimer = window.setTimeout(() => {
-                  emojiPreArmRestoreTimer = null;
-                  restorePreArmedBridge();
-                }, WIN_EMOJI_NO_BLUR_RESTORE_MS);
               }
             }
-          } else if (event.key === ' ') {
-            // Win+Space (keyboard language switch) keeps window focus — no panel
-            // is opening, so hand focus back to the editor immediately.
-            restorePreArmedBridge();
           }
+          return;
+        }
+
+        if (isWindowsPanelShortcut) {
+          traceWindowsEmojiInput('panel-keydown', event, view, singleLine);
+          if (emojiBridgeActiveRef.current) {
+            emojiPanelConfirmed = true;
+          }
+        }
+
+        // Win+Space is the normal Windows input-language switch. It is not the
+        // emoji picker, so return focus immediately whenever this key is exposed.
+        if (event.metaKey && (event.code === 'Space' || event.key === ' ')) {
+          languageSwitchPending = true;
+          if (emojiBridgeActiveRef.current) {
+            suspendExternalSyncRef.current = false;
+            restoreEditorFromEmojiBridge();
+          }
+          // Do not prevent the native language switch. The matching keyup
+          // below restores the caret after Windows has handled it.
+          return;
         }
         if (event.key === 'Escape' && emojiBridgeActiveRef.current) {
           suspendExternalSyncRef.current = false;
           restoreEditorFromEmojiBridge();
         }
-      };
-
-      const handleDocumentPointerDown = (event: PointerEvent) => {
-        if (!emojiBridgeActiveRef.current || event.target === emojiBridge) return;
-        suspendExternalSyncRef.current = false;
-        restoreEditorFromEmojiBridge();
       };
 
       // The shell swallows the Win+. / Win+; / Win+V keyDOWN, but the keyUP of
@@ -2544,11 +2757,49 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
       // crucial on Windows builds where these panels do NOT blur the window at
       // all (observed in the field), so the no-blur restore timer must not fire.
       const handleSystemShortcutKeyUp = (event: KeyboardEvent) => {
+        const isAltKey = event.key === 'Alt'
+          || event.code === 'AltLeft'
+          || event.code === 'AltRight';
+        if (isAltKey) {
+          restoreEditorAfterAlt();
+          return;
+        }
+        // Win+Space is the language switch. Windows usually swallows its keyDOWN,
+        // so languageSwitchPending never gets set and the keyUP is the only signal
+        // the page ever sees — restore on it whenever the bridge is armed without a
+        // confirmed panel. Without this the bridge kept the keyboard after every
+        // language switch: typing still reached the note, but the caret was gone.
+        if (event.code === 'Space' || event.key === ' ') {
+          if (languageSwitchPending || (emojiBridgeActiveRef.current && !emojiPanelConfirmed)) {
+            languageSwitchPending = false;
+            suspendExternalSyncRef.current = false;
+            restoreEditorAfterAlt();
+            return;
+          }
+        }
         if (!emojiBridgeActiveRef.current) return;
         if (event.code === 'Period' || event.code === 'Semicolon' || event.code === 'KeyV') {
           traceWindowsEmojiInput('panel-keyup-confirm', event, view, singleLine);
-          cancelEmojiPreArmRestore();
+          emojiPanelConfirmed = true;
+          return;
         }
+
+        const isWindowsKeyUp = event.key === 'Meta'
+          || event.code === 'MetaLeft'
+          || event.code === 'MetaRight';
+        if (!isWindowsKeyUp || emojiPanelConfirmed) return;
+        // The Windows key was released and no panel ever announced itself. If a
+        // real panel (or the Start menu) had opened, the window would be blurred
+        // and handleWindowFocus takes care of the restore; anything else means the
+        // bridge is silently holding the keyboard, so give it back shortly after.
+        if (windowsKeyRestoreTimer !== null) window.clearTimeout(windowsKeyRestoreTimer);
+        windowsKeyRestoreTimer = window.setTimeout(() => {
+          windowsKeyRestoreTimer = null;
+          if (!emojiBridgeActiveRef.current || emojiPanelConfirmed) return;
+          if (!document.hasFocus()) return;
+          suspendExternalSyncRef.current = false;
+          restoreEditorFromEmojiBridge();
+        }, 400);
       };
 
       const handleWindowBlur = (event: FocusEvent) => {
@@ -2557,26 +2808,47 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
         // window's own blur means the OS moved focus to another window/panel.
         if (event.target !== window) return;
         traceWindowsEmojiInput('window-blur', null, view, singleLine);
-        // Hand off to the emoji bridge ONLY when this blur is the Windows emoji
-        // picker opening (a Win press happened just before). Alt-tab, clicking
-        // another app, or a spurious OS focus blip must leave editing untouched.
-        if (Date.now() - lastMetaKeyDownAtRef.current > WIN_EMOJI_BLUR_WINDOW_MS) return;
-        // A panel really opened — keep a pre-armed bridge focused for as long as
-        // the panel is up instead of auto-restoring.
-        cancelEmojiPreArmRestore();
-        if (emojiBridgeActiveRef.current) return;
-        const activeElement = document.activeElement;
-        if (
-          view.hasFocus
-          || (activeElement instanceof Node && view.dom.contains(activeElement))
-        ) {
-          suspendExternalSyncRef.current = true;
-          activateEmojiInputBridge();
+        // A generic blur from switching language, an IME panel, Alt+Tab, or a
+        // notification must never start an emoji session or move the caret.
+        if (!emojiBridgeActiveRef.current) return;
+        // Do not steal focus after Windows opens a system panel. The picker has
+        // already selected CodeMirror's contenteditable as its text target.
+        // While that native panel is visible, CodeMirror reports itself as blurred.
+        // React would otherwise apply every local draft back into the unfocused
+        // view and replace its DOM text target, which makes Windows stop inserting
+        // after the first couple of emoji. Resume on window focus below.
+        suspendExternalSyncRef.current = true;
+        if (emojiBridgeActiveRef.current) {
+          // Do NOT confirm an emoji panel here. A window blur while the bridge is
+          // armed is NOT proof the emoji picker opened — pressing the Windows key
+          // (Start menu), Win+Space (language switch), or alt-tab blur the window
+          // too. Setting emojiPanelConfirmed=true here made handleWindowFocus skip
+          // its restore, so the caret stayed trapped in the hidden bridge forever
+          // and every following key/backspace went there instead of the note.
+          // Real confirmation comes only from actual emoji evidence: a Period/
+          // Semicolon/KeyV keyup, or text flowing into the bridge. The window-focus
+          // handler restores the editor if no such evidence ever arrives.
         }
       };
 
-      const handleWindowFocus = () => {
+      const handleWindowFocus = (event: FocusEvent) => {
+        // Window's capture listener also sees focus events from every element.
+        // In particular, emojiBridge.focus() used to arrive here and immediately
+        // restore CodeMirror, so Windows' picker lost its native text target after
+        // the first selection. Only the window itself signals that a system panel
+        // has closed and the app regained focus.
+        if (event.target !== window) return;
         traceWindowsEmojiInput('window-focus', null, view, singleLine);
+        // The window regained focus while a bridge is armed but no real emoji/
+        // clipboard panel was ever confirmed — this was a bare Windows-key press
+        // (Start menu) that stole the caret. Hand focus straight back to the
+        // editor instead of leaving it trapped in the hidden bridge, which forced
+        // the user to click back into the note before they could keep typing.
+        if (emojiBridgeActiveRef.current && !emojiPanelConfirmed) {
+          suspendExternalSyncRef.current = false;
+          restoreEditorFromEmojiBridge();
+          return;
+        }
         // Keep the native text control focused while the Windows emoji panel
         // is open. Restoring here used to happen before the user could click
         // an emoji, so Windows had no active text target to insert into.
@@ -2593,7 +2865,8 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
       };
 
       emojiBridge?.addEventListener('input', scheduleEmojiBridgeCommit);
-      document.addEventListener('pointerdown', handleDocumentPointerDown, true);
+      emojiBridge?.addEventListener('beforeinput', scheduleEmojiBridgeCommit);
+      emojiBridge?.addEventListener('compositionend', scheduleEmojiBridgeCommit);
       window.addEventListener('keydown', handleSystemShortcutKeyDown, true);
       window.addEventListener('keyup', handleSystemShortcutKeyUp, true);
       window.addEventListener('blur', handleWindowBlur, true);
@@ -2652,13 +2925,14 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
       }
 
       return () => {
+        cancelTextDragArm();
         stopCtrlDragTracking?.();
         stopNativeCtrlDoubleClickTracking?.();
         clearEmojiBridgeTimers();
-        cancelEmojiPreArmRestore();
         stopEmojiForensicTrace?.();
         emojiBridge?.removeEventListener('input', scheduleEmojiBridgeCommit);
-        document.removeEventListener('pointerdown', handleDocumentPointerDown, true);
+        emojiBridge?.removeEventListener('beforeinput', scheduleEmojiBridgeCommit);
+        emojiBridge?.removeEventListener('compositionend', scheduleEmojiBridgeCommit);
         window.removeEventListener('keydown', handleSystemShortcutKeyDown, true);
         window.removeEventListener('keyup', handleSystemShortcutKeyUp, true);
         window.removeEventListener('blur', handleWindowBlur, true);
