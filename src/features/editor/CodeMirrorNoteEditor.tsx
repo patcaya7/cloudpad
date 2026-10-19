@@ -1333,7 +1333,12 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
         view.dispatch({
           changes: { from: 0, to: view.state.doc.length, insert: snapshot.value },
           selection: EditorSelection.create(selectionRanges, mainIndex),
-          effects: setBoldRangesEffect.of(ranges)
+          // Swapping the whole document in one change (rather than a minimal
+          // diff) invalidates CodeMirror's scroll anchor, so without an
+          // explicit scrollIntoView it snaps the viewport to the top instead
+          // of keeping the restored cursor visible — this is what made
+          // undo/redo look like they jumped to the top of a long note.
+          effects: [setBoldRangesEffect.of(ranges), EditorView.scrollIntoView(selectionRanges[mainIndex].head, { y: 'nearest' })]
         });
       } finally {
         isRestoringSnapshotRef.current = false;

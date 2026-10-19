@@ -3,7 +3,7 @@ import type { ChangeEvent, CSSProperties, MouseEvent as ReactMouseEvent, Pointer
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { LogicalSize } from '@tauri-apps/api/dpi';
-import { emitTo, listen } from '@tauri-apps/api/event';
+import { emit, emitTo, listen } from '@tauri-apps/api/event';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { currentMonitor, getCurrentWindow } from '@tauri-apps/api/window';
 import { open as openDialog, save } from '@tauri-apps/plugin-dialog';
@@ -78,12 +78,13 @@ interface FormatContextMenuState {
 
 type EditorMultiLineRange = SearchRange;
 
-type FindWindowActionPayload =
+type FindWindowActionPayload = { target?: string } & (
   | { action: 'find'; direction: SearchDirection; request: FindReplaceRequest }
   | { action: 'replace'; request: FindReplaceRequest }
   | { action: 'replaceAll'; request: FindReplaceRequest }
   | { action: 'formatMatches'; request: FindReplaceRequest }
-  | { action: 'close' };
+  | { action: 'close' }
+);
 
 const FONT_OPTIONS = [
   { label: 'Google Sans Text', value: DEFAULT_FONT_FAMILY },
@@ -137,6 +138,25 @@ function normalizeColorInputValue(color: string | undefined, fallback = '#172033
 
 const ZOOM_STORAGE_KEY = 'cloudpad.appZoom.v1';
 const NOTE_ZOOM_STORAGE_KEY = 'cloudpad.noteZoom.v2';
+// Detached note windows keep their own zoom so resizing text there doesn't
+// change the main window's zoom on next launch.
+const DETACHED_ZOOM_STORAGE_KEY = 'cloudpad.appZoom.detached.v1';
+const DETACHED_NOTE_ZOOM_STORAGE_KEY = 'cloudpad.noteZoom.detached.v1';
+// Broadcast to every window after a note is written, so other windows showing
+// the same note (main list, detached note windows) reload it from SQLite.
+const NOTES_CHANGED_EVENT = 'cloudpad-notes-changed';
+const NOTES_CHANGED_RELOAD_DELAY_MS = 350;
+// Detached windows never sync themselves; Ctrl+S there asks the main window to.
+const SYNC_REQUEST_EVENT = 'cloudpad-sync-request';
+// Lets the main window mark which notes are currently open in their own window.
+const NOTE_WINDOW_OPENED_EVENT = 'cloudpad-note-window-opened';
+const NOTE_WINDOW_CLOSED_EVENT = 'cloudpad-note-window-closed';
+const NOTE_WINDOW_QUERY_EVENT = 'cloudpad-note-window-query';
+const NOTE_WINDOW_LABEL_PREFIX = 'note-';
+const NOTE_WINDOW_WIDTH = 760;
+const NOTE_WINDOW_HEIGHT = 680;
+const NOTE_WINDOW_MIN_WIDTH = 420;
+const NOTE_WINDOW_MIN_HEIGHT = 360;
 const WINDOW_SIZE_STORAGE_KEY = 'cloudpad.windowSize.v1';
 const SYNC_INTERVAL_STORAGE_KEY = 'cloudpad.syncIntervalSec.v1';
 // Must match EMOJI_INPUT_BRIDGE_STORAGE_KEY in CodeMirrorNoteEditor — the editor
@@ -635,6 +655,34 @@ function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
+function getCurrentWindowLabel(): string {
+  if (!isTauriRuntime()) return 'main';
+  try {
+    return getCurrentWindow().label;
+  } catch {
+    return 'main';
+  }
+}
+
+// Window labels only allow letters, digits, '-', '_', '/' and ':'.
+function getNoteWindowLabel(noteId: string): string {
+  return `${NOTE_WINDOW_LABEL_PREFIX}${noteId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+}
+
+interface NotesChangedPayload {
+  source: string;
+}
+
+interface NoteWindowStatePayload {
+  noteId: string;
+}
+
+interface NoteContextMenuState {
+  note: Note;
+  x: number;
+  y: number;
+}
+
 async function getFindWindowInitialPlacement(): Promise<{ x: number; y: number }> {
   const mainWindow = getCurrentWindow();
   const [mainPosition, mainSize, monitor, scaleFactor] = await Promise.all([
@@ -777,19 +825,85 @@ function SmoothSyncStatus({
   );
 }
 
-export default function App() {
+interface SyncRipple {
+  id: number;
+  x: number;
+  y: number;
+  size: number;
+}
+
+function SyncNowButton({ syncing, onSync }: { syncing: boolean; onSync: () => void }) {
+  const [ripples, setRipples] = useState<SyncRipple[]>([]);
+  const nextRippleIdRef = useRef(0);
+
+  return (
+    <button
+      type="button"
+      className={`sync-button ${syncing ? 'is-syncing' : ''}`}
+      onClick={onSync}
+      disabled={syncing}
+      onPointerDown={(event) => {
+        if (syncing || event.button !== 0) return;
+        const button = event.currentTarget;
+        const rect = button.getBoundingClientRect();
+        // The whole app is scaled by --app-zoom, so convert the viewport-space
+        // pointer position back into the button's own (unscaled) pixels.
+        const scale = button.offsetWidth > 0 ? rect.width / button.offsetWidth : 1;
+        const x = (event.clientX - rect.left) / scale;
+        const y = (event.clientY - rect.top) / scale;
+        const reach = Math.max(
+          Math.hypot(x, y),
+          Math.hypot(button.offsetWidth - x, y),
+          Math.hypot(x, button.offsetHeight - y),
+          Math.hypot(button.offsetWidth - x, button.offsetHeight - y)
+        );
+        const id = nextRippleIdRef.current++;
+        setRipples((current) => [...current, { id, x, y, size: reach * 2 }]);
+      }}
+    >
+      <span className="sync-button__icon" aria-hidden="true">☁</span>
+      <span className="sync-button__label">{syncing ? 'กำลังซิงก์...' : 'Sync Now'}</span>
+      {ripples.map((ripple) => (
+        <span
+          key={ripple.id}
+          className="sync-button__ripple"
+          aria-hidden="true"
+          style={{ left: ripple.x, top: ripple.y, width: ripple.size, height: ripple.size }}
+          onAnimationEnd={(event) => {
+            if (event.target !== event.currentTarget) return;
+            setRipples((current) => current.filter((item) => item.id !== ripple.id));
+          }}
+        />
+      ))}
+    </button>
+  );
+}
+
+export default function App({ detachedNoteId = null }: { detachedNoteId?: string | null }) {
+  // A detached window shows a single note only: no sidebar, no sync loop (the
+  // main window owns syncing), and it never switches to another note.
+  const isDetached = detachedNoteId !== null;
+  const appZoomStorageKey = isDetached ? DETACHED_ZOOM_STORAGE_KEY : ZOOM_STORAGE_KEY;
+  const noteZoomStorageKey = isDetached ? DETACHED_NOTE_ZOOM_STORAGE_KEY : NOTE_ZOOM_STORAGE_KEY;
+  const windowLabelRef = useRef(getCurrentWindowLabel());
   const auth = useAuthStore();
   const [notes, setNotes] = useState<Note[]>([]);
   const [deletedNotes, setDeletedNotes] = useState<Note[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [hasLoadedNotes, setHasLoadedNotes] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(detachedNoteId);
+  const [noteContextMenu, setNoteContextMenu] = useState<NoteContextMenuState | null>(null);
+  // Main window only: notes that currently have their own detached window open.
+  const [detachedNoteIds, setDetachedNoteIds] = useState<ReadonlySet<string>>(() => new Set());
   const [query, setQuery] = useState('');
   const [initialFilter, setInitialFilter] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<SyncState>('local');
-  const [syncMessage, setSyncMessage] = useState('กำลังเตรียมข้อมูลในเครื่อง...');
+  const [syncMessage, setSyncMessage] = useState(
+    isDetached ? 'หน้าต่างแยก · ซิงก์ผ่านหน้าต่างหลัก' : 'กำลังเตรียมข้อมูลในเครื่อง...'
+  );
   const [isSaving, setIsSaving] = useState(false);
   const [lastSavedMessage, setLastSavedMessage] = useState<string | null>(null);
-  const [appZoom, setAppZoom] = useState(() => readStoredZoom(ZOOM_STORAGE_KEY, DEFAULT_APP_ZOOM));
-  const [noteZoom, setNoteZoom] = useState(() => readStoredZoom(NOTE_ZOOM_STORAGE_KEY, DEFAULT_NOTE_ZOOM));
+  const [appZoom, setAppZoom] = useState(() => readStoredZoom(appZoomStorageKey, DEFAULT_APP_ZOOM));
+  const [noteZoom, setNoteZoom] = useState(() => readStoredZoom(noteZoomStorageKey, DEFAULT_NOTE_ZOOM));
   // Live width of the pane the note sheet is drawn in; drives the automatic fit.
   const [noteCanvasWidth, setNoteCanvasWidth] = useState(0);
   const [syncIntervalSec, setSyncIntervalSec] = useState(() => readStoredSyncIntervalSec());
@@ -895,7 +1009,9 @@ export default function App() {
   const lastEditActivityAtRef = useRef(0);
 
   const canUseNotes = !auth.cloudEnabled || Boolean(auth.user);
-  const selectedNote = notes.find((note) => note.id === selectedId) ?? notes[0] ?? null;
+  const selectedNote = isDetached
+    ? notes.find((note) => note.id === detachedNoteId) ?? null
+    : notes.find((note) => note.id === selectedId) ?? notes[0] ?? null;
   const appStyle = { '--app-zoom': String(appZoom) } as CSSProperties;
   const noteFit = noteCanvasWidth > 0
     ? clamp(noteCanvasWidth / NOTE_SHEET_WIDTH, NOTE_FIT_MIN, NOTE_FIT_MAX)
@@ -961,7 +1077,16 @@ export default function App() {
     });
   }, []);
 
-  const reloadNotes = useCallback(async (nextSelectedId?: string | null) => {
+  const broadcastNotesChanged = useCallback(() => {
+    if (!isTauriRuntime()) return;
+    const payload: NotesChangedPayload = { source: windowLabelRef.current };
+    void emit(NOTES_CHANGED_EVENT, payload).catch(() => undefined);
+  }, []);
+
+  const reloadNotes = useCallback(async (
+    nextSelectedId?: string | null,
+    options: { broadcast?: boolean } = {}
+  ) => {
     // A reload is about to replace the whole in-memory note list with fresh data
     // from disk/cloud. Discard (don't apply) any still-pending title resort so it
     // can't reapply a stale patch on top of the freshly reloaded notes — the title
@@ -994,12 +1119,16 @@ export default function App() {
     nextNotes.forEach((note) => hydrateImagesFromContentHtml(note.contentHtml));
     setNotes(sortNotesForList(nextNotes));
     setDeletedNotes(nextDeletedNotes);
-    setSelectedId((currentId) => {
-      if (nextSelectedId !== undefined) return nextSelectedId;
-      if (currentId && nextNotes.some((note) => note.id === currentId)) return currentId;
-      return nextNotes[0]?.id ?? null;
-    });
-  }, [auth.cloudEnabled, auth.user]);
+    setHasLoadedNotes(true);
+    if (!isDetached) {
+      setSelectedId((currentId) => {
+        if (nextSelectedId !== undefined) return nextSelectedId;
+        if (currentId && nextNotes.some((note) => note.id === currentId)) return currentId;
+        return nextNotes[0]?.id ?? null;
+      });
+    }
+    if (options.broadcast !== false) broadcastNotesChanged();
+  }, [auth.cloudEnabled, auth.user, broadcastNotesChanged, isDetached]);
 
   // The note list keeps an optimistic 'pending' badge the moment an edit is saved
   // (see promoteNoteToTopInList). That marker can outlive the real state: if a sync
@@ -1078,12 +1207,13 @@ export default function App() {
   useEffect(() => {
     async function boot() {
       await setupNotes();
-      await reloadNotes();
+      await reloadNotes(undefined, { broadcast: false });
     }
     void boot();
   }, [reloadNotes]);
 
   useEffect(() => {
+    if (isDetached) return;
     if (!auth.cloudEnabled) {
       setSyncState('local');
       setSyncMessage('Local-only · ยังไม่ได้ตั้งค่า Supabase');
@@ -1094,9 +1224,12 @@ export default function App() {
       setSyncState('ready');
       setSyncMessage('Cloud พร้อมใช้งาน · เข้าสู่ระบบเพื่อเริ่มซิงก์');
     }
-  }, [auth.cloudEnabled, auth.loading, auth.user]);
+  }, [auth.cloudEnabled, auth.loading, auth.user, isDetached]);
 
   useEffect(() => {
+    // Only the main window runs the sync loop; detached windows would otherwise
+    // upload/download the same notes in parallel.
+    if (isDetached) return;
     // Wait for auth to resolve before deciding the cloud status, otherwise a
     // logged-in refresh briefly shows "เข้าสู่ระบบเพื่อเริ่มซิงก์" before syncing.
     if (auth.cloudEnabled && auth.loading) return;
@@ -1140,15 +1273,15 @@ export default function App() {
     return () => {
       if (timeoutId !== null) window.clearTimeout(timeoutId);
     };
-  }, [auth.cloudEnabled, auth.loading, auth.user, handleSync, syncIntervalSec]);
+  }, [auth.cloudEnabled, auth.loading, auth.user, handleSync, isDetached, syncIntervalSec]);
 
   useEffect(() => {
-    localStorage.setItem(ZOOM_STORAGE_KEY, String(appZoom));
-  }, [appZoom]);
+    localStorage.setItem(appZoomStorageKey, String(appZoom));
+  }, [appZoom, appZoomStorageKey]);
 
   useEffect(() => {
-    localStorage.setItem(NOTE_ZOOM_STORAGE_KEY, String(noteZoom));
-  }, [noteZoom]);
+    localStorage.setItem(noteZoomStorageKey, String(noteZoom));
+  }, [noteZoom, noteZoomStorageKey]);
 
   // Track the pane the sheet is drawn in. clientWidth is a LAYOUT width, so it is
   // already free of the app-zoom transform — exactly the number the sheet's own
@@ -1174,12 +1307,13 @@ export default function App() {
     // Show the What's New panel automatically once per version bump — but never
     // on someone's very first launch (nothing to compare against yet), only when
     // we can see they already had an older version installed.
+    if (isDetached) return;
     const lastSeenVersion = localStorage.getItem(LAST_SEEN_VERSION_STORAGE_KEY);
     if (lastSeenVersion && lastSeenVersion !== APP_VERSION) {
       setIsWhatsNewOpen(true);
     }
     localStorage.setItem(LAST_SEEN_VERSION_STORAGE_KEY, APP_VERSION);
-  }, []);
+  }, [isDetached]);
 
   useEffect(() => {
     if (!formatContextMenu.open) return;
@@ -1246,7 +1380,8 @@ export default function App() {
     notesRef.current = nextNotes;
     setNotes(nextNotes);
     void updateNoteListOrder(nextNotes.map((note) => note.id));
-  }, []);
+    broadcastNotesChanged();
+  }, [broadcastNotesChanged]);
 
   useEffect(() => {
     if (selectedNote) {
@@ -1295,7 +1430,8 @@ export default function App() {
   }, [lastSavedMessage]);
 
   useEffect(() => {
-    if (!isTauriRuntime()) return;
+    // The stored size belongs to the main window; detached windows keep their own.
+    if (!isTauriRuntime() || isDetached) return;
 
     const appWindow = getCurrentWindow();
     const storedSize = readStoredWindowSize();
@@ -1320,7 +1456,7 @@ export default function App() {
       window.removeEventListener('beforeunload', writeCurrentWindowSize);
       void unlistenResizePromise.then((unlisten) => unlisten());
     };
-  }, []);
+  }, [isDetached]);
 
   async function handleCreateNote() {
     if (!canUseNotes) {
@@ -1493,6 +1629,7 @@ export default function App() {
     setLastSavedMessage(nextPinned ? 'ปักหมุดโน้ตแล้ว' : 'ยกเลิกปักหมุดโน้ตแล้ว');
     await updateNotePin(note.id, nextPinned);
     await updateNoteListOrder(updatedNotes.map((item) => item.id));
+    broadcastNotesChanged();
   }
 
   async function handleDropNote(targetNote: Note) {
@@ -1523,6 +1660,7 @@ export default function App() {
       await updateNotePin(draggingNoteId, targetNote.isPinned);
     }
     await updateNoteListOrder(movedNotes.map((note) => note.id));
+    broadcastNotesChanged();
     setLastSavedMessage('จัดลำดับรายการโน้ตแล้ว');
   }
 
@@ -1800,6 +1938,14 @@ export default function App() {
     if (!draft) return;
     editorDraftRef.current = null;
 
+    // An editor that just received a reload (cloud sync or another window) fires
+    // onChange with the same text it was given; writing that back would bump the
+    // note's timestamp, mark it pending sync and ping-pong between windows.
+    const storedNote = notesRef.current.find((note) => note.id === draft.noteId);
+    if (storedNote && storedNote.content === draft.content && storedNote.contentHtml === draft.contentHtml) {
+      return;
+    }
+
     await updateNote(draft.noteId, {
       content: draft.content,
       contentHtml: draft.contentHtml,
@@ -1876,8 +2022,13 @@ export default function App() {
     // interval". Without this the card sat on 'pending' until the next background
     // tick even though the user had explicitly asked to save. Fire-and-forget: the
     // sync's own state updates drive the badge (pending → syncing → synced).
+    // A detached window hands this to the main window so only one window ever syncs.
+    if (isDetached) {
+      if (isTauriRuntime()) void emit(SYNC_REQUEST_EVENT, {}).catch(() => undefined);
+      return;
+    }
     void handleSync();
-  }, [auth.user?.id, getEditorContentHtml, getEditorPlainText, handleSync, promoteSavedNote, selectedNote]);
+  }, [auth.user?.id, getEditorContentHtml, getEditorPlainText, handleSync, isDetached, promoteSavedNote, selectedNote]);
 
   const clearSavedSelectionHighlight = useCallback(() => {
     const cssWithHighlights = CSS as unknown as { highlights?: { delete: (name: string) => void } };
@@ -2897,6 +3048,7 @@ export default function App() {
 
     setIsFindOpen(false);
 
+    const owner = windowLabelRef.current;
     void (async () => {
       try {
         const existingWindow = await WebviewWindow.getByLabel('find-replace');
@@ -2904,13 +3056,14 @@ export default function App() {
           setIsFindOpen(false);
           await existingWindow.show();
           await existingWindow.setFocus();
-          await emitTo('find-replace', 'cloudpad-find-open', { initialQuery });
+          await emitTo('find-replace', 'cloudpad-find-open', { initialQuery, owner });
           return;
         }
 
         const search = new URLSearchParams({
           window: 'find-replace',
-          q: initialQuery
+          q: initialQuery,
+          owner
         });
         const placement = await getFindWindowInitialPlacement();
         const findWindow = new WebviewWindow('find-replace', {
@@ -2933,7 +3086,7 @@ export default function App() {
 
         findWindow.once('tauri://created', async () => {
           await findWindow.setFocus();
-          await emitTo('find-replace', 'cloudpad-find-open', { initialQuery });
+          await emitTo('find-replace', 'cloudpad-find-open', { initialQuery, owner });
         });
         findWindow.once('tauri://error', () => {
           setIsFindOpen(true);
@@ -3182,6 +3335,208 @@ export default function App() {
     syncRichEditorContent
   ]);
 
+  // Another window saved a note: save our own pending edits first (so nothing
+  // typed here is lost), then reload from SQLite. Debounced because one save
+  // emits several events (title, body, list order) in quick succession.
+  const refreshFromOtherWindowRef = useRef<() => Promise<void>>(async () => undefined);
+  refreshFromOtherWindowRef.current = async () => {
+    flushTitlePromote();
+    await flushEditorDraft();
+    await reloadNotes(undefined, { broadcast: false });
+  };
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    let reloadTimeoutId: number | null = null;
+
+    void listen<NotesChangedPayload>(NOTES_CHANGED_EVENT, (event) => {
+      if (event.payload?.source === windowLabelRef.current) return;
+      if (reloadTimeoutId !== null) window.clearTimeout(reloadTimeoutId);
+      reloadTimeoutId = window.setTimeout(() => {
+        reloadTimeoutId = null;
+        void refreshFromOtherWindowRef.current();
+      }, NOTES_CHANGED_RELOAD_DELAY_MS);
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+
+    return () => {
+      disposed = true;
+      if (reloadTimeoutId !== null) window.clearTimeout(reloadTimeoutId);
+      unlisten?.();
+    };
+  }, []);
+
+  const detachedWindowTitle = isDetached ? (selectedNote?.title.trim() || 'ไม่มีชื่อ') : null;
+  useEffect(() => {
+    if (!detachedWindowTitle || !isTauriRuntime()) return;
+    void getCurrentWindow().setTitle(`${detachedWindowTitle} · CloudPad`).catch(() => undefined);
+  }, [detachedWindowTitle]);
+
+  // Closing a detached window must not drop the last keystrokes still waiting
+  // in the save debounce.
+  const flushBeforeCloseRef = useRef<() => Promise<void>>(async () => undefined);
+  flushBeforeCloseRef.current = async () => {
+    flushTitlePromote();
+    await flushEditorDraft();
+  };
+
+  useEffect(() => {
+    if (!isDetached || !detachedNoteId || !isTauriRuntime()) return;
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void getCurrentWindow().onCloseRequested(async () => {
+      await flushBeforeCloseRef.current().catch(() => undefined);
+      const payload: NoteWindowStatePayload = { noteId: detachedNoteId };
+      await emit(NOTE_WINDOW_CLOSED_EVENT, payload).catch(() => undefined);
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [detachedNoteId, isDetached]);
+
+  // Detached window: tell the main window this note is open here, and answer
+  // again whenever the main window asks (e.g. after it reloaded).
+  useEffect(() => {
+    if (!isDetached || !detachedNoteId || !isTauriRuntime()) return;
+    const announce = () => {
+      const payload: NoteWindowStatePayload = { noteId: detachedNoteId };
+      void emit(NOTE_WINDOW_OPENED_EVENT, payload).catch(() => undefined);
+    };
+    announce();
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void listen(NOTE_WINDOW_QUERY_EVENT, announce).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [detachedNoteId, isDetached]);
+
+  const markNoteWindowClosed = useCallback((noteId: string) => {
+    setDetachedNoteIds((current) => {
+      if (!current.has(noteId)) return current;
+      const next = new Set(current);
+      next.delete(noteId);
+      return next;
+    });
+  }, []);
+
+  // Main window: keep track of open note windows and run syncs they request.
+  const handleSyncRef = useRef(handleSync);
+  handleSyncRef.current = handleSync;
+  useEffect(() => {
+    if (isDetached || !isTauriRuntime()) return;
+    const cleanups: Array<() => void> = [];
+    let disposed = false;
+    const keep = (registration: Promise<() => void>) => registration.then((cleanup) => {
+      if (disposed) cleanup();
+      else cleanups.push(cleanup);
+    });
+
+    void Promise.all([
+      keep(listen(SYNC_REQUEST_EVENT, () => {
+        void handleSyncRef.current();
+      })),
+      keep(listen<NoteWindowStatePayload>(NOTE_WINDOW_OPENED_EVENT, (event) => {
+        const noteId = event.payload?.noteId;
+        if (!noteId) return;
+        setDetachedNoteIds((current) => (current.has(noteId) ? current : new Set(current).add(noteId)));
+      })),
+      keep(listen<NoteWindowStatePayload>(NOTE_WINDOW_CLOSED_EVENT, (event) => {
+        if (event.payload?.noteId) markNoteWindowClosed(event.payload.noteId);
+      }))
+    ]).then(() => {
+      if (!disposed) void emit(NOTE_WINDOW_QUERY_EVENT, {}).catch(() => undefined);
+    });
+
+    return () => {
+      disposed = true;
+      cleanups.forEach((cleanup) => cleanup());
+    };
+  }, [isDetached, markNoteWindowClosed]);
+
+  const openNoteInNewWindow = useCallback(async (note: Note) => {
+    setNoteContextMenu(null);
+    if (!isTauriRuntime()) return;
+
+    // The new window reads the note from SQLite, so persist anything still
+    // pending in this window before it loads.
+    flushTitlePromote();
+    await flushEditorDraft();
+
+    const label = getNoteWindowLabel(note.id);
+    try {
+      const existingWindow = await WebviewWindow.getByLabel(label);
+      if (existingWindow) {
+        await existingWindow.unminimize();
+        await existingWindow.show();
+        await existingWindow.setFocus();
+        return;
+      }
+
+      const search = new URLSearchParams({ window: 'note', noteId: note.id });
+      const noteWindow = new WebviewWindow(label, {
+        url: `index.html?${search.toString()}`,
+        title: `${note.title.trim() || 'ไม่มีชื่อ'} · CloudPad`,
+        width: NOTE_WINDOW_WIDTH,
+        height: NOTE_WINDOW_HEIGHT,
+        minWidth: NOTE_WINDOW_MIN_WIDTH,
+        minHeight: NOTE_WINDOW_MIN_HEIGHT,
+        resizable: true,
+        focus: true,
+        center: true,
+        // Match the main window (tauri.conf "theme": "Light") so the native title
+        // bar isn't dark on a Windows dark-mode system.
+        theme: 'light'
+      });
+      noteWindow.once('tauri://error', () => {
+        setAccountMessage('เปิดโน้ตในหน้าต่างใหม่ไม่สำเร็จ');
+      });
+      // Backup for the window's own "closed" announcement (e.g. if it crashed).
+      void noteWindow.once('tauri://destroyed', () => {
+        markNoteWindowClosed(note.id);
+      });
+    } catch {
+      setAccountMessage('เปิดโน้ตในหน้าต่างใหม่ไม่สำเร็จ');
+    }
+  }, [flushEditorDraft, flushTitlePromote, markNoteWindowClosed]);
+
+  useEffect(() => {
+    if (!noteContextMenu) return;
+    const close = () => setNoteContextMenu(null);
+    const handlePointerDown = (event: PointerEvent) => {
+      if ((event.target as Element | null)?.closest?.('.note-context-menu')) return;
+      close();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    window.addEventListener('pointerdown', handlePointerDown, true);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('resize', close);
+    window.addEventListener('blur', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown, true);
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('blur', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [noteContextMenu]);
+
   useEffect(() => {
     if (!isTauriRuntime()) return;
 
@@ -3189,6 +3544,9 @@ export default function App() {
 
     void listen<FindWindowActionPayload>('cloudpad-find-action', (event) => {
       const payload = event.payload;
+      // The find panel tags each action with the window that opened it, so a
+      // detached note window and the main window never both apply a replace.
+      if ((payload.target ?? 'main') !== windowLabelRef.current) return;
       if (payload.action === 'find') {
         handleFindReplaceFind(payload.direction, payload.request);
         return;
@@ -3583,6 +3941,45 @@ export default function App() {
       )
     : null;
 
+  const noteContextMenuPortal = noteContextMenu && typeof document !== 'undefined'
+    ? createPortal(
+        <div
+          className="note-context-menu"
+          role="menu"
+          aria-label={`เมนูโน้ต ${noteContextMenu.note.title || 'ไม่มีชื่อ'}`}
+          style={{
+            left: Math.max(8, Math.min(noteContextMenu.x, window.innerWidth - 232)),
+            top: Math.max(8, Math.min(noteContextMenu.y, window.innerHeight - 112))
+          }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              const target = noteContextMenu.note;
+              setNoteContextMenu(null);
+              void handleToggleNotePin(target);
+            }}
+          >
+            <span aria-hidden="true">📌</span>
+            {noteContextMenu.note.isPinned ? 'เลิกปักหมุด' : 'ปักหมุด'}
+          </button>
+          {isTauriRuntime() && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => void openNoteInNewWindow(noteContextMenu.note)}
+            >
+              <span aria-hidden="true">⧉</span>
+              {detachedNoteIds.has(noteContextMenu.note.id) ? 'ไปที่หน้าต่างแยก' : 'เปิดในหน้าต่างใหม่'}
+            </button>
+          )}
+        </div>,
+        document.body
+      )
+    : null;
+
   const topbarStatusState: SyncState | 'saved' = isSaving
     ? 'syncing'
     : lastSavedMessage
@@ -3598,7 +3995,7 @@ export default function App() {
   return (
     <>
       <main
-        className="app-shell"
+        className={`app-shell ${isDetached ? 'detached-note-window' : ''}`}
         style={appStyle}
         onWheel={(event) => {
           if (!event.ctrlKey) return;
@@ -3607,6 +4004,7 @@ export default function App() {
           setAppZoom((current) => clamp(Number((current + direction * ZOOM_STEP).toFixed(2)), ZOOM_MIN, ZOOM_MAX));
         }}
       >
+      {!isDetached && (
       <aside className="sidebar">
         <div className="account-hover-zone">
           <button className="account-float-button" type="button">
@@ -4011,7 +4409,7 @@ export default function App() {
               tabIndex={0}
               className={`note-card ${selectedNote?.id === note.id ? 'active' : ''} ${note.isPinned ? 'pinned' : ''} ${draggingNoteId === note.id ? 'dragging' : ''} ${dragOverNoteId === note.id && draggingNoteId !== note.id ? 'drag-over' : ''} ${isNoteSelectMode ? 'select-mode' : ''} ${bulkSelectedNoteIds.includes(note.id) ? 'selected' : ''}`}
               draggable={false}
-              data-tooltip={isNoteSelectMode ? 'คลิกเพื่อเลือก/ยกเลิกเลือก' : 'คลิกขวาเพื่อปักหมุด / ลากเพื่อจัดลำดับ'}
+              data-tooltip={isNoteSelectMode ? 'คลิกเพื่อเลือก/ยกเลิกเลือก' : 'คลิกขวาเพื่อปักหมุด / เปิดในหน้าต่างใหม่ · ลากเพื่อจัดลำดับ'}
               onKeyDown={(event) => {
                 if (event.key !== 'Enter' && event.key !== ' ') return;
                 event.preventDefault();
@@ -4020,7 +4418,7 @@ export default function App() {
               onContextMenu={(event) => {
                 event.preventDefault();
                 if (isNoteSelectMode) return;
-                void handleToggleNotePin(note);
+                setNoteContextMenu({ note, x: event.clientX, y: event.clientY });
               }}
               onDragStart={(event) => {
                 if (isNoteSelectMode) return;
@@ -4099,6 +4497,9 @@ export default function App() {
                 />
               )}
               {note.isPinned && <span className="note-pin-indicator" aria-label="ปักหมุด">📌</span>}
+              {detachedNoteIds.has(note.id) && (
+                <span className="note-detached-indicator" aria-label="เปิดอยู่ในหน้าต่างแยก">⧉ เปิดแยก</span>
+              )}
               <strong data-tooltip={note.title || 'ไม่มีชื่อ'}>
                 {renderSearchHighlight(note.title || 'ไม่มีชื่อ', query)}
               </strong>
@@ -4286,6 +4687,7 @@ export default function App() {
         </div>
 
       </aside>
+      )}
 
       <section className="editor-panel">
         <header className="topbar">
@@ -4331,15 +4733,31 @@ export default function App() {
                   +
                 </button>
               </div>
-              <button className="sync-button" onClick={handleSync} disabled={syncState === 'syncing'}>
-                {syncState === 'syncing' ? 'กำลังซิงก์...' : '☁ Sync Now'}
-              </button>
+              {!isDetached && (
+                <SyncNowButton syncing={syncState === 'syncing'} onSync={() => void handleSync()} />
+              )}
             </div>
           </div>
         </header>
 
         {selectedNote ? (
           <div className="editor">
+            {!isDetached && detachedNoteIds.has(selectedNote.id) && (
+              <div className="detached-note-banner" role="status">
+                <span className="detached-note-banner__icon" aria-hidden="true">⧉</span>
+                <span className="detached-note-banner__text">
+                  <strong>โน้ตนี้เปิดแยกอยู่ในอีกหน้าต่าง</strong>
+                  <small>แก้ไขได้ทั้งสองที่ ข้อมูลอัปเดตตามกัน</small>
+                </span>
+                <button
+                  type="button"
+                  className="detached-note-banner__button"
+                  onClick={() => void openNoteInNewWindow(selectedNote)}
+                >
+                  ไปที่หน้าต่างแยก
+                </button>
+              </div>
+            )}
             <div className="title-row">
             <div
               className="title-input title-editor-shell"
@@ -4409,16 +4827,18 @@ export default function App() {
                 onOpenFind={openFindReplacePanel}
               />
             </div>
-            <button
-              type="button"
-              className="title-delete-button"
-              onClick={handleDeleteNote}
-              disabled={!selectedNote}
-              title="ลบโน้ต"
-              aria-label="ลบโน้ต"
-            >
-              🗑
-            </button>
+            {!isDetached && (
+              <button
+                type="button"
+                className="title-delete-button"
+                onClick={handleDeleteNote}
+                disabled={!selectedNote}
+                title="ลบโน้ต"
+                aria-label="ลบโน้ต"
+              >
+                🗑
+              </button>
+            )}
             </div>
             <div
               ref={noteCanvasRef}
@@ -4504,6 +4924,31 @@ export default function App() {
                 />
               </div>
             </div>
+          </div>
+        ) : isDetached ? (
+          <div className="empty-state">
+            {auth.cloudEnabled && !auth.loading && !auth.user ? (
+              <>
+                <h2>ยังไม่ได้เข้าสู่ระบบ</h2>
+                <p>เข้าสู่ระบบในหน้าต่างหลักก่อน แล้วเปิดโน้ตนี้อีกครั้ง</p>
+              </>
+            ) : !hasLoadedNotes ? (
+              <h2>กำลังเปิดโน้ต...</h2>
+            ) : (
+              <>
+                <h2>ไม่พบโน้ตนี้</h2>
+                <p>โน้ตอาจถูกย้ายไปถังขยะหรือถูกลบจากหน้าต่างหลักแล้ว</p>
+              </>
+            )}
+            {isTauriRuntime() && (
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void getCurrentWindow().close()}
+              >
+                ปิดหน้าต่าง
+              </button>
+            )}
           </div>
         ) : (
           <div className="empty-state">
@@ -4705,6 +5150,7 @@ export default function App() {
       )}
       </main>
       {formatContextMenuPortal}
+      {noteContextMenuPortal}
       {findPanelPortal}
       <CustomTooltip />
     </>

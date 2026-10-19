@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { LogicalSize } from '@tauri-apps/api/dpi';
 import { emitTo, listen } from '@tauri-apps/api/event';
@@ -8,6 +8,7 @@ import type { SearchDirection } from './searchUtils';
 
 interface FindWindowOpenPayload {
   initialQuery: string;
+  owner?: string;
 }
 
 interface FindWindowResultPayload {
@@ -36,6 +37,9 @@ export function FindReplaceWindow() {
   const [resultMessage, setResultMessage] = useState('');
   const [findWindowZoom, setFindWindowZoom] = useState(1);
   const [openSequence, setOpenSequence] = useState(0);
+  // The editor window that opened this panel (main window or a detached note
+  // window); find/replace actions are sent back to it only.
+  const ownerRef = useRef(new URLSearchParams(window.location.search).get('owner') || 'main');
 
   const updateFindWindowZoom = (nextZoom: number) => {
     const clamped = clampFindWindowZoom(Number(nextZoom.toFixed(2)));
@@ -50,6 +54,7 @@ export function FindReplaceWindow() {
     let unlistenResult: (() => void) | null = null;
 
     void listen<FindWindowOpenPayload>('cloudpad-find-open', (event) => {
+      if (event.payload.owner) ownerRef.current = event.payload.owner;
       setInitialQuery(event.payload.initialQuery ?? '');
       setResultMessage('');
       setOpenSequence((current) => current + 1);
@@ -93,24 +98,30 @@ export function FindReplaceWindow() {
     };
   }, []);
 
+  // `target` lets every editor window ignore actions meant for another window.
+  const sendToOwner = (payload: Record<string, unknown>) => {
+    const target = ownerRef.current;
+    void emitTo(target, 'cloudpad-find-action', { ...payload, target });
+  };
+
   const sendFindAction = (direction: SearchDirection, request: FindReplaceRequest) => {
-    void emitTo('main', 'cloudpad-find-action', { action: 'find', direction, request });
+    sendToOwner({ action: 'find', direction, request });
   };
 
   const sendReplaceAction = (request: FindReplaceRequest) => {
-    void emitTo('main', 'cloudpad-find-action', { action: 'replace', request });
+    sendToOwner({ action: 'replace', request });
   };
 
   const sendReplaceAllAction = (request: FindReplaceRequest) => {
-    void emitTo('main', 'cloudpad-find-action', { action: 'replaceAll', request });
+    sendToOwner({ action: 'replaceAll', request });
   };
 
   const sendFormatMatchesAction = (request: FindReplaceRequest) => {
-    void emitTo('main', 'cloudpad-find-action', { action: 'formatMatches', request });
+    sendToOwner({ action: 'formatMatches', request });
   };
 
   const closeWindow = () => {
-    void emitTo('main', 'cloudpad-find-action', { action: 'close' });
+    sendToOwner({ action: 'close' });
     void getCurrentWebviewWindow().close();
   };
 
