@@ -1,6 +1,6 @@
 [package]
 name = "cloudpad"
-version = "0.6.93"
+version = "0.6.96"
 description = "CloudPad offline-first notepad"
 authors = ["CloudPad"]
 homepage = "https://drive.google.com/drive/folders/1GJXNIPLtO5VnS0SPS4heBSkL0gNKzFbZ"

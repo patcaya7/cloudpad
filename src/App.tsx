@@ -992,6 +992,10 @@ export default function App({ detachedNoteId = null }: { detachedNoteId?: string
   const editorSaveTimeoutRef = useRef<number | null>(null);
   const editorUndoStackRef = useRef<string[]>([]);
   const editorRedoStackRef = useRef<string[]>([]);
+  // Content/HTML last read from or written to SQLite per note. Only used to skip
+  // writing back an editor value that is already on disk; when unsure (entry
+  // missing) the save always goes ahead.
+  const persistedContentRef = useRef(new Map<string, { content: string; contentHtml: string }>());
   const editorDraftRef = useRef<{
     noteId: string;
     userId: string | null;
@@ -1117,6 +1121,9 @@ export default function App({ detachedNoteId = null }: { detachedNoteId?: string
     // cloud sync originating on another device) into this device's image store,
     // BEFORE the notes render so their tokens draw as pictures, not placeholders.
     nextNotes.forEach((note) => hydrateImagesFromContentHtml(note.contentHtml));
+    persistedContentRef.current = new Map(
+      nextNotes.map((note) => [note.id, { content: note.content, contentHtml: note.contentHtml }])
+    );
     setNotes(sortNotesForList(nextNotes));
     setDeletedNotes(nextDeletedNotes);
     setHasLoadedNotes(true);
@@ -1881,6 +1888,7 @@ export default function App({ detachedNoteId = null }: { detachedNoteId?: string
     setIsSaving(true);
     setLastSavedMessage(null);
     const updatedAt = new Date().toISOString();
+    persistedContentRef.current.delete(selectedNote.id);
     promoteSavedNote(selectedNote.id, patch, updatedAt);
 
     try {
@@ -1914,6 +1922,7 @@ export default function App({ detachedNoteId = null }: { detachedNoteId?: string
     if (!selectedNote) return;
     const updatedAt = new Date().toISOString();
     lastEditActivityAtRef.current = Date.now();
+    persistedContentRef.current.delete(selectedNote.id);
 
     void updateNote(selectedNote.id, {
       ...patch,
@@ -1941,8 +1950,11 @@ export default function App({ detachedNoteId = null }: { detachedNoteId?: string
     // An editor that just received a reload (cloud sync or another window) fires
     // onChange with the same text it was given; writing that back would bump the
     // note's timestamp, mark it pending sync and ping-pong between windows.
-    const storedNote = notesRef.current.find((note) => note.id === draft.noteId);
-    if (storedNote && storedNote.content === draft.content && storedNote.contentHtml === draft.contentHtml) {
+    // Compare against what is known to be ON DISK — not notesRef, which
+    // promoteSavedNote updates optimistically before this write (e.g. on every
+    // bold/colour change), so comparing to it skipped real formatting saves.
+    const persisted = persistedContentRef.current.get(draft.noteId);
+    if (persisted && persisted.content === draft.content && persisted.contentHtml === draft.contentHtml) {
       return;
     }
 
@@ -1950,6 +1962,10 @@ export default function App({ detachedNoteId = null }: { detachedNoteId?: string
       content: draft.content,
       contentHtml: draft.contentHtml,
       userId: draft.userId
+    });
+    persistedContentRef.current.set(draft.noteId, {
+      content: draft.content,
+      contentHtml: draft.contentHtml
     });
 
     const pendingDraft = editorDraftRef.current as { noteId: string } | null;
@@ -2008,6 +2024,10 @@ export default function App({ detachedNoteId = null }: { detachedNoteId?: string
         fontWeight: selectedNote.fontWeight,
         fontFamily: selectedNote.fontFamily,
         userId: selectedNote.userId ?? auth.user?.id ?? null
+      });
+      persistedContentRef.current.set(selectedNote.id, {
+        content: editorContent,
+        contentHtml: editorContentHtml
       });
       promoteSavedNote(selectedNote.id, {
         content: editorContent,

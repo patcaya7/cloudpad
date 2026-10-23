@@ -4782,3 +4782,8 @@ button:active:not(:disabled) {
   padding: 0 9px;
   font-size: 11px;
 }
+
+/* Held long enough on selected text: the next drag moves it. */
+.cm-content.cm-text-drag-armed {
+  cursor: grab;
+}

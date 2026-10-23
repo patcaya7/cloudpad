@@ -178,6 +178,10 @@ async function openDetectedLink(url: string): Promise<void> {
 // so Ctrl+Z reverts a burst of text instead of a single character at a time.
 const TYPING_UNDO_GROUP_MS = 400;
 
+// How long the mouse must be held on an already-selected piece of text before
+// dragging it moves the text instead of starting a new selection.
+const TEXT_DRAG_HOLD_MS = 450;
+
 // The Windows emoji-picker bridge is opt-in via Settings. Some Windows WebViews
 // swallow the Period key before JavaScript can see it, so the enabled compatibility
 // path must prepare the native text target on the Windows key itself.
@@ -1956,6 +1960,23 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
           textDragArmTimer = null;
         }
         isTextDragArmed = false;
+        viewRef.current?.contentDOM.classList.remove('cm-text-drag-armed');
+      };
+
+      // True only when the pointer is physically over the blue selection band the
+      // user can see. Comparing document positions instead counted a press on the
+      // gap right before/after a highlighted word as "inside" it (a position at
+      // the edge of the range), so starting a fresh drag next to a word that
+      // Ctrl+B had just left selected picked that word up and moved it.
+      const isPointerOverSelectionHighlight = (view: EditorView, event: MouseEvent) => {
+        const bands = Array.from(view.dom.querySelectorAll<HTMLElement>('.cm-selectionBackground'));
+        return bands.some((band) => {
+          const rect = band.getBoundingClientRect();
+          return event.clientX > rect.left + 1
+            && event.clientX < rect.right - 1
+            && event.clientY >= rect.top
+            && event.clientY <= rect.bottom;
+        });
       };
 
       const armTextDrag = (view: EditorView, event: MouseEvent) => {
@@ -1969,16 +1990,17 @@ export const CodeMirrorNoteEditor = forwardRef<CodeMirrorNoteEditorHandle, CodeM
           || event.shiftKey
         ) return;
 
-        const position = posFromMouseEvent(view, event);
-        const startsInsideSelection = view.state.selection.ranges.some(
-          (range) => !range.empty && position >= range.from && position <= range.to
-        );
-        if (!startsInsideSelection) return;
+        if (!isPointerOverSelectionHighlight(view, event)) return;
 
+        // A deliberate "press and hold" — long enough that an ordinary pause
+        // before dragging out a new selection from a highlighted word does not
+        // turn into moving that word. Moving the pointer first (a normal drag)
+        // never arms it.
         textDragArmTimer = window.setTimeout(() => {
           textDragArmTimer = null;
           isTextDragArmed = true;
-        }, 180);
+          view.contentDOM.classList.add('cm-text-drag-armed');
+        }, TEXT_DRAG_HOLD_MS);
       };
 
       const startCtrlDragSelection = (view: EditorView, event: MouseEvent) => {
